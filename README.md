@@ -104,7 +104,7 @@ Single-threaded:
 radguard export-all app.apk output
 ```
 
-Parallel, automatically using all logical CPUs available to the process:
+Parallel, automatically using half the logical CPUs available to the process:
 
 ```bash
 radguard export-all-parallel app.apk output
@@ -126,9 +126,14 @@ output/
         └── MainActivity$Inner.java
 ```
 
-For multidex APKs, workers concurrently read, decompress, parse, and decompile different DEX
-files. Only exact root entries named `classes.dex` or `classesN.dex` are selected. Unrelated APK
-resources are not extracted or decompressed.
+For multidex APKs, RadGuard loads the APK once, validates its Central Directory, and runs DEX
+inflate/parse tasks and class-decompilation tasks in one global worker pool. A single DEX uses at
+most eight class workers, while different DEX files can run concurrently. Only exact root entries
+named `classes.dex` or `classesN.dex` are selected; unrelated resources are not extracted.
+
+Directory output and `RGOUT001` output share this same APK pipeline. Only the final sink differs:
+directory export writes each class to its package path, while aggregate export buffers indexed
+class chunks and writes them in deterministic DEX/class order.
 
 ### Binary aggregate output
 

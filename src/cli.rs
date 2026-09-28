@@ -1,8 +1,9 @@
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsStr;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::writer::SourceOutput;
 use crate::{Decompiler, DexFile};
@@ -22,7 +23,10 @@ pub struct InspectSummary {
     pub parse_duration: std::time::Duration,
 }
 
-/// Thread-safe callback invoked for APK export progress events.
+/// Thread-safe callback invoked for APK export lifecycle events.
+///
+/// Directory-export callbacks may run concurrently on pipeline workers and
+/// must not assume event ordering by DEX number.
 pub type ProgressCallback = Arc<dyn Fn(ExportProgress) + Send + Sync + 'static>;
 
 /// Options shared by directory and `RGOUT001` exports.
@@ -47,7 +51,8 @@ impl Default for ExportOptions {
 }
 
 impl ExportOptions {
-    /// Uses all logical CPUs reported as available to this process.
+    /// Uses half of the logical CPUs reported as available to this process.
+    /// At least one worker is always selected.
     pub fn parallel() -> Self {
         Self {
             thread_count: Some(default_thread_count()),
@@ -55,7 +60,12 @@ impl ExportOptions {
         }
     }
 
-    /// Uses exactly `thread_count` workers. Zero is rejected by export calls.
+    /// Uses a global budget of exactly `thread_count` pipeline workers.
+    ///
+    /// For APK directory export, workers share DEX inflate/parse and class
+    /// decompile/write tasks. Each individual DEX uses at most eight concurrent
+    /// class tasks, while different DEX files may be decompiled concurrently.
+    /// Zero is rejected by export calls.
     pub const fn with_threads(mut self, thread_count: usize) -> Self {
         self.thread_count = Some(thread_count);
         self
@@ -67,7 +77,7 @@ impl ExportOptions {
         self
     }
 
-    /// Invokes `callback` whenever one DEX from an APK finishes.
+    /// Invokes `callback` for APK pipeline lifecycle and progress events.
     pub fn with_progress<F>(mut self, callback: F) -> Self
     where
         F: Fn(ExportProgress) + Send + Sync + 'static,
@@ -89,24 +99,69 @@ impl ExportOptions {
 }
 
 /// Progress events emitted while exporting an APK.
+///
+/// `DexInflated` follows successful decompression, CRC verification, parsing,
+/// and class-task creation. `DexWorking` is emitted once when a DEX's first
+/// class task starts. Events may be delivered concurrently and out of DEX order.
 #[derive(Clone, Copy, Debug)]
 pub enum ExportProgress {
     Started {
         total_dex_files: usize,
         worker_count: usize,
     },
+    DexInflated {
+        inflated_dex_files: usize,
+        total_dex_files: usize,
+        dex_number: u32,
+        inflate_workers: usize,
+    },
+    Activity {
+        busy_workers: usize,
+        idle_workers: usize,
+        decompile_workers: usize,
+        decompile_dex_files: usize,
+        inflate_workers: usize,
+        queued_dex_files: usize,
+        ready_dex_files: usize,
+        total_dex_files: usize,
+    },
+    DexWorking {
+        started_dex_files: usize,
+        total_dex_files: usize,
+        dex_number: u32,
+        busy_workers: usize,
+        idle_workers: usize,
+        decompile_workers: usize,
+        decompile_dex_files: usize,
+        inflate_workers: usize,
+    },
     DexCompleted {
         completed_dex_files: usize,
         total_dex_files: usize,
         dex_number: u32,
         dex_duration: std::time::Duration,
+        busy_workers: usize,
+        idle_workers: usize,
+        decompile_workers: usize,
+        decompile_dex_files: usize,
+        inflate_workers: usize,
     },
 }
 
 impl ExportProgress {
     pub fn percentage(self) -> f64 {
         match self {
-            Self::Started { .. } => 0.0,
+            Self::Started { .. } | Self::Activity { .. } => 0.0,
+            Self::DexInflated {
+                inflated_dex_files,
+                total_dex_files,
+                ..
+            } => inflated_dex_files as f64 * 100.0 / total_dex_files as f64,
+            Self::DexWorking {
+                started_dex_files,
+                total_dex_files,
+                ..
+            } => started_dex_files as f64 * 100.0 / total_dex_files as f64,
             Self::DexCompleted {
                 completed_dex_files,
                 total_dex_files,
@@ -200,12 +255,17 @@ fn usage(program: &str) {
     eprintln!(
         "       {program} export-all-dad-parallel <file.dex|file.apk> [thread-count] [output-directory]"
     );
-    eprintln!("       (thread-count defaults to the available logical CPU count)");
+    eprintln!("       (thread-count defaults to half the available logical CPU count)");
+}
+
+fn default_thread_count_for(available: usize) -> usize {
+    (available / 2).max(1)
 }
 
 fn default_thread_count() -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
+        .map(default_thread_count_for)
         .unwrap_or(1)
 }
 
@@ -269,6 +329,199 @@ fn export_dex_to_directory(
         write_java_class(output_directory, &descriptor, &source.source)?;
     }
     Ok(count)
+}
+
+const APK_MAX_DECOMPILE_WORKERS: usize = 8;
+const APK_CLASS_CHUNK_SIZE: usize = 16;
+
+type CompletionState = Arc<(Mutex<usize>, Condvar)>;
+
+/// Live counters for the CPU stages of one APK export. File writes are not
+/// included: the CLI reports only the user-provided worker budget.
+struct PipelineWorkers {
+    budget: usize,
+    inflating: AtomicUsize,
+    inflate_completed: AtomicUsize,
+    decompiling: AtomicUsize,
+    decompiling_dexes: AtomicUsize,
+    started_dexes: AtomicUsize,
+    queued_dex: AtomicUsize,
+    ready_dex: AtomicUsize,
+    last_report: Mutex<Option<std::time::Instant>>,
+}
+
+impl PipelineWorkers {
+    fn snapshot(&self) -> (usize, usize, usize, usize, usize, usize, usize) {
+        let inflate_workers = self.inflating.load(Ordering::Relaxed);
+        let decompile_workers = self.decompiling.load(Ordering::Relaxed);
+        let busy_workers = inflate_workers + decompile_workers;
+        (
+            busy_workers,
+            self.budget.saturating_sub(busy_workers),
+            decompile_workers,
+            self.decompiling_dexes.load(Ordering::Relaxed),
+            inflate_workers,
+            self.queued_dex.load(Ordering::Relaxed),
+            self.ready_dex.load(Ordering::Relaxed),
+        )
+    }
+}
+
+fn complete_apk_dex(
+    completion: &CompletionState,
+    callback: Option<&(dyn Fn(ExportProgress) + Send + Sync)>,
+    total_dex_files: usize,
+    number: u32,
+    duration: std::time::Duration,
+    workers: Option<&PipelineWorkers>,
+) -> usize {
+    let (lock, changed) = &**completion;
+    let completed = {
+        let mut count = lock.lock().expect("APK completion mutex poisoned");
+        *count += 1;
+        let completed = *count;
+        changed.notify_all();
+        completed
+    };
+    report_apk_progress(
+        callback,
+        completed,
+        total_dex_files,
+        number,
+        duration,
+        workers,
+    );
+    completed
+}
+
+#[derive(Debug)]
+struct PipelineState {
+    error: Mutex<Option<crate::Error>>,
+}
+
+impl PipelineState {
+    fn record(&self, error: crate::Error) {
+        let mut first = self.error.lock().expect("pipeline error mutex poisoned");
+        if first.is_none() {
+            *first = Some(error);
+        }
+    }
+
+    fn finish(self) -> crate::Result<()> {
+        self.error
+            .into_inner()
+            .expect("pipeline error mutex poisoned")
+            .map_or(Ok(()), Err)
+    }
+}
+
+struct DexOutputState {
+    pending_chunks: usize,
+    reported_complete: bool,
+}
+
+struct ReadyDex {
+    number: u32,
+    started: std::time::Instant,
+    decompiler: Arc<Decompiler<'static>>,
+    active_decompilers: AtomicUsize,
+    working_reported: AtomicBool,
+    output: Mutex<DexOutputState>,
+}
+
+struct ClassJob {
+    dex: Arc<ReadyDex>,
+    range: std::ops::Range<usize>,
+}
+
+enum PipelineTask {
+    Inflate(DexZipEntry),
+    Decompile(ClassJob, bool),
+}
+
+struct PipelineTaskState {
+    inflate: VecDeque<DexZipEntry>,
+    decompile: VecDeque<ClassJob>,
+    closed: bool,
+    active_inflaters: usize,
+    inflate_limit: usize,
+}
+
+type SharedPipelineTasks = Arc<(Mutex<PipelineTaskState>, Condvar)>;
+
+fn pipeline_push(tasks: &SharedPipelineTasks, task: PipelineTask) {
+    let (lock, changed) = &**tasks;
+    let mut state = lock.lock().expect("pipeline task mutex poisoned");
+    match task {
+        PipelineTask::Inflate(task) => state.inflate.push_back(task),
+        PipelineTask::Decompile(task, _) => state.decompile.push_back(task),
+    }
+    changed.notify_all();
+}
+
+fn pipeline_pop(tasks: &SharedPipelineTasks) -> Option<PipelineTask> {
+    let (lock, changed) = &**tasks;
+    let mut state = lock.lock().expect("pipeline task mutex poisoned");
+    loop {
+        // While compressed entries remain, reserve T-8 workers for preparing
+        // DEX and leave at most eight workers for class work.
+        if state.active_inflaters < state.inflate_limit
+            && let Some(task) = state.inflate.pop_front()
+        {
+            state.active_inflaters += 1;
+            return Some(PipelineTask::Inflate(task));
+        }
+        // Start one chunk from every ready DEX before assigning additional
+        // lanes to an already-running DEX. This prevents a contiguous run of
+        // chunks from the first few DEX files monopolizing the worker pool.
+        let position = state
+            .decompile
+            .iter()
+            .position(|task| task.dex.active_decompilers.load(Ordering::Relaxed) == 0)
+            .or_else(|| {
+                state.decompile.iter().position(|task| {
+                    task.dex.active_decompilers.load(Ordering::Relaxed) < APK_MAX_DECOMPILE_WORKERS
+                })
+            });
+        if let Some(position) = position {
+            let task = state
+                .decompile
+                .remove(position)
+                .expect("located decompile task disappeared");
+            let previous = task.dex.active_decompilers.fetch_add(1, Ordering::Relaxed);
+            assert!(
+                previous < APK_MAX_DECOMPILE_WORKERS,
+                "per-DEX decompile worker limit exceeded"
+            );
+            return Some(PipelineTask::Decompile(task, previous == 0));
+        }
+        if state.closed {
+            return None;
+        }
+        state = changed.wait(state).expect("pipeline task mutex poisoned");
+    }
+}
+
+fn pipeline_finish_inflate(tasks: &SharedPipelineTasks) {
+    let (lock, changed) = &**tasks;
+    let mut state = lock.lock().expect("pipeline task mutex poisoned");
+    state.active_inflaters -= 1;
+    changed.notify_all();
+}
+
+fn pipeline_finish_decompile(tasks: &SharedPipelineTasks, dex: &ReadyDex) -> bool {
+    let (lock, changed) = &**tasks;
+    let _state = lock.lock().expect("pipeline task mutex poisoned");
+    let previous = dex.active_decompilers.fetch_sub(1, Ordering::Relaxed);
+    assert!(previous != 0, "per-DEX decompile worker count underflow");
+    changed.notify_all();
+    previous == 1
+}
+
+fn pipeline_close(tasks: &SharedPipelineTasks) {
+    let (lock, changed) = &**tasks;
+    lock.lock().expect("pipeline task mutex poisoned").closed = true;
+    changed.notify_all();
 }
 
 fn dex_entry_number(name: &str) -> Option<u32> {
@@ -367,111 +620,148 @@ fn zip64_entry_values(
     ))
 }
 
-fn apk_dex_entries(input: &Path) -> crate::Result<Vec<DexZipEntry>> {
-    const MAX_EOCD_SIZE: u64 = 65_557;
-    let mut apk = std::fs::File::open(input)?;
-    let file_len = apk.metadata()?.len();
-    let tail_len = file_len.min(MAX_EOCD_SIZE) as usize;
-    apk.seek(SeekFrom::End(-(tail_len as i64)))?;
-    let mut tail = vec![0; tail_len];
-    apk.read_exact(&mut tail)?;
-    let eocd = tail
-        .windows(4)
-        .rposition(|signature| signature == b"PK\x05\x06")
-        .ok_or_else(|| std::io::Error::other("APK has no ZIP end record"))?;
-    let eocd_absolute = file_len - tail_len as u64 + eocd as u64;
-    let entries_16 = zip_u16(&tail, eocd + 10)?;
-    let directory_size_32 = zip_u32(&tail, eocd + 12)?;
-    let directory_offset_32 = zip_u32(&tail, eocd + 16)?;
-    let (entry_count, directory_size, directory_offset) = if entries_16 == u16::MAX
-        || directory_size_32 == u32::MAX
-        || directory_offset_32 == u32::MAX
-    {
-        let locator_absolute = eocd_absolute
-            .checked_sub(20)
-            .ok_or_else(|| std::io::Error::other("invalid ZIP64 locator"))?;
-        apk.seek(SeekFrom::Start(locator_absolute))?;
-        let mut locator = [0; 20];
-        apk.read_exact(&mut locator)?;
-        if &locator[..4] != b"PK\x06\x07" {
-            return Err(std::io::Error::other("missing ZIP64 locator").into());
-        }
-        let zip64_offset = zip_u64(&locator, 8)?;
-        apk.seek(SeekFrom::Start(zip64_offset))?;
-        let mut zip64 = [0; 56];
-        apk.read_exact(&mut zip64)?;
-        if &zip64[..4] != b"PK\x06\x06" {
-            return Err(std::io::Error::other("invalid ZIP64 end record").into());
-        }
-        (
-            zip_u64(&zip64, 32)?,
-            zip_u64(&zip64, 40)?,
-            zip_u64(&zip64, 48)?,
-        )
-    } else {
-        (
-            u64::from(entries_16),
-            u64::from(directory_size_32),
-            u64::from(directory_offset_32),
-        )
-    };
-    let directory_len = usize::try_from(directory_size)
-        .map_err(|_| std::io::Error::other("ZIP directory is too large"))?;
-    apk.seek(SeekFrom::Start(directory_offset))?;
-    let mut directory = vec![0; directory_len];
-    apk.read_exact(&mut directory)?;
+struct ZipDirectory {
+    range: std::ops::Range<usize>,
+    archive_offset: usize,
+}
 
+fn zip_central_directory(apk: &[u8]) -> crate::Result<ZipDirectory> {
+    const MAX_EOCD_SIZE: usize = 22 + u16::MAX as usize;
+    let tail_start = apk.len().saturating_sub(MAX_EOCD_SIZE);
+    let eocd = apk[tail_start..]
+        .windows(4)
+        .enumerate()
+        .rev()
+        .find_map(|(relative, signature)| {
+            if signature != b"PK\x05\x06" {
+                return None;
+            }
+            let offset = tail_start + relative;
+            let comment_len = usize::from(zip_u16(apk, offset + 20).ok()?);
+            (offset.checked_add(22 + comment_len) == Some(apk.len())).then_some(offset)
+        })
+        .ok_or_else(|| std::io::Error::other("APK has no valid ZIP end record"))?;
+    let entries = zip_u16(apk, eocd + 10)?;
+    let size_32 = zip_u32(apk, eocd + 12)?;
+    let offset_32 = zip_u32(apk, eocd + 16)?;
+    let (directory_size, directory_offset, directory_end) =
+        if entries == u16::MAX || size_32 == u32::MAX || offset_32 == u32::MAX {
+            let locator = eocd
+                .checked_sub(20)
+                .ok_or_else(|| std::io::Error::other("invalid ZIP64 locator"))?;
+            if apk.get(locator..locator + 4) != Some(b"PK\x06\x07") {
+                return Err(std::io::Error::other("missing ZIP64 locator").into());
+            }
+            let _zip64_relative = zip_u64(apk, locator + 8)?;
+            let zip64 = apk[..locator]
+                .windows(4)
+                .rposition(|signature| signature == b"PK\x06\x06")
+                .ok_or_else(|| std::io::Error::other("missing ZIP64 end record"))?;
+            let size = usize::try_from(zip_u64(apk, zip64 + 40)?)
+                .map_err(|_| std::io::Error::other("ZIP64 directory is too large"))?;
+            let offset = usize::try_from(zip_u64(apk, zip64 + 48)?)
+                .map_err(|_| std::io::Error::other("ZIP64 directory offset is too large"))?;
+            (size, offset, zip64)
+        } else {
+            (size_32 as usize, offset_32 as usize, eocd)
+        };
+    let physical_start = directory_end
+        .checked_sub(directory_size)
+        .ok_or_else(|| std::io::Error::other("invalid ZIP central directory size"))?;
+    let archive_offset = physical_start
+        .checked_sub(directory_offset)
+        .ok_or_else(|| std::io::Error::other("invalid ZIP archive offset"))?;
+    Ok(ZipDirectory {
+        range: physical_start..directory_end,
+        archive_offset,
+    })
+}
+
+/// Finds `classes*.dex` by scanning only the real central-directory bytes for
+/// the literal `classes` name. The APK itself remains one shared memory buffer.
+fn apk_dex_entries(apk: &[u8]) -> crate::Result<Vec<DexZipEntry>> {
+    let directory = zip_central_directory(apk)?;
     let mut dex_entries = Vec::new();
-    let mut cursor = 0;
-    for _ in 0..entry_count {
-        if directory.get(cursor..cursor + 4) != Some(b"PK\x01\x02") {
-            return Err(std::io::Error::other("invalid ZIP central directory entry").into());
+    for relative_name_start in apk[directory.range.clone()]
+        .windows(b"classes".len())
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == b"classes").then_some(offset))
+    {
+        let name_start = directory.range.start + relative_name_start;
+        let Some(header_start) = name_start.checked_sub(46) else {
+            continue;
+        };
+        if header_start < directory.range.start
+            || apk.get(header_start..header_start + 4) != Some(b"PK\x01\x02")
+        {
+            continue;
         }
-        let flags = zip_u16(&directory, cursor + 8)?;
-        let compression = zip_u16(&directory, cursor + 10)?;
-        let crc32 = zip_u32(&directory, cursor + 16)?;
-        let compressed_32 = zip_u32(&directory, cursor + 20)?;
-        let uncompressed_32 = zip_u32(&directory, cursor + 24)?;
-        let name_len = usize::from(zip_u16(&directory, cursor + 28)?);
-        let extra_len = usize::from(zip_u16(&directory, cursor + 30)?);
-        let comment_len = usize::from(zip_u16(&directory, cursor + 32)?);
-        let local_offset_32 = zip_u32(&directory, cursor + 42)?;
-        let name_start = cursor + 46;
+        let flags = zip_u16(apk, header_start + 8)?;
+        let compression = zip_u16(apk, header_start + 10)?;
+        let crc32 = zip_u32(apk, header_start + 16)?;
+        let compressed_32 = zip_u32(apk, header_start + 20)?;
+        let uncompressed_32 = zip_u32(apk, header_start + 24)?;
+        let name_len = usize::from(zip_u16(apk, header_start + 28)?);
+        let extra_len = usize::from(zip_u16(apk, header_start + 30)?);
+        let comment_len = usize::from(zip_u16(apk, header_start + 32)?);
+        let local_offset_32 = zip_u32(apk, header_start + 42)?;
         let name_end = name_start + name_len;
         let extra_end = name_end + extra_len;
         let entry_end = extra_end + comment_len;
-        let name = directory
-            .get(name_start..name_end)
-            .ok_or_else(|| std::io::Error::other("truncated ZIP entry name"))?;
-        let extra = directory
-            .get(name_end..extra_end)
-            .ok_or_else(|| std::io::Error::other("truncated ZIP entry extra field"))?;
-        if let Ok(name) = std::str::from_utf8(name)
-            && let Some(number) = dex_entry_number(name)
-        {
-            if flags & 1 != 0 {
-                return Err(std::io::Error::other("encrypted DEX entry is unsupported").into());
-            }
-            let (uncompressed_size, compressed_size, local_offset) =
-                zip64_entry_values(extra, uncompressed_32, compressed_32, local_offset_32)?;
-            apk.seek(SeekFrom::Start(local_offset))?;
-            let mut local_header = [0; 30];
-            apk.read_exact(&mut local_header)?;
-            if &local_header[..4] != b"PK\x03\x04" {
-                return Err(std::io::Error::other("invalid ZIP local header").into());
-            }
-            let local_name_len = u64::from(zip_u16(&local_header, 26)?);
-            let local_extra_len = u64::from(zip_u16(&local_header, 28)?);
-            dex_entries.push(DexZipEntry {
-                number,
-                data_start: local_offset + 30 + local_name_len + local_extra_len,
-                compressed_size,
-                uncompressed_size,
-                crc32,
-                compression,
-            });
+        let Some(name) = apk.get(name_start..name_end) else {
+            continue;
+        };
+        if entry_end > directory.range.end {
+            continue;
         }
-        cursor = entry_end;
+        let Ok(name) = std::str::from_utf8(name) else {
+            continue;
+        };
+        let Some(number) = dex_entry_number(name) else {
+            continue;
+        };
+        if flags & 1 != 0 {
+            return Err(std::io::Error::other("encrypted DEX entry is unsupported").into());
+        }
+        let extra = &apk[name_end..extra_end];
+        let (uncompressed_size, compressed_size, local_offset) =
+            zip64_entry_values(extra, uncompressed_32, compressed_32, local_offset_32)?;
+        let local_offset = directory
+            .archive_offset
+            .checked_add(
+                usize::try_from(local_offset)
+                    .map_err(|_| std::io::Error::other("DEX local offset is too large"))?,
+            )
+            .ok_or_else(|| std::io::Error::other("DEX local offset overflow"))?;
+        let local_header = apk
+            .get(local_offset..local_offset + 30)
+            .ok_or_else(|| std::io::Error::other("truncated ZIP local header"))?;
+        if &local_header[..4] != b"PK\x03\x04" {
+            return Err(std::io::Error::other("invalid ZIP local header").into());
+        }
+        let data_start = local_offset
+            .checked_add(
+                30 + usize::from(zip_u16(local_header, 26)?)
+                    + usize::from(zip_u16(local_header, 28)?),
+            )
+            .ok_or_else(|| std::io::Error::other("DEX data offset overflow"))?;
+        let data_end = data_start
+            .checked_add(
+                usize::try_from(compressed_size)
+                    .map_err(|_| std::io::Error::other("compressed DEX is too large"))?,
+            )
+            .ok_or_else(|| std::io::Error::other("DEX data range overflow"))?;
+        if data_end > apk.len() {
+            return Err(std::io::Error::other("truncated DEX ZIP payload").into());
+        }
+        dex_entries.push(DexZipEntry {
+            number,
+            data_start: data_start as u64,
+            compressed_size,
+            uncompressed_size,
+            crc32,
+            compression,
+        });
     }
     dex_entries.sort_unstable_by_key(|entry| entry.number);
     if dex_entries.is_empty() {
@@ -498,25 +788,122 @@ fn dex_entry_name(number: u32) -> String {
     }
 }
 
+fn report_pipeline_activity(
+    callback: Option<&(dyn Fn(ExportProgress) + Send + Sync)>,
+    workers: &PipelineWorkers,
+    total_dex_files: usize,
+) {
+    let Some(callback) = callback else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let mut last = workers
+        .last_report
+        .lock()
+        .expect("pipeline reporter mutex poisoned");
+    if last.is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(250)) {
+        return;
+    }
+    *last = Some(now);
+    drop(last);
+    let (
+        busy_workers,
+        idle_workers,
+        decompile_workers,
+        decompile_dex_files,
+        inflate_workers,
+        queued_dex_files,
+        ready_dex_files,
+    ) = workers.snapshot();
+    callback(ExportProgress::Activity {
+        busy_workers,
+        idle_workers,
+        decompile_workers,
+        decompile_dex_files,
+        inflate_workers,
+        queued_dex_files,
+        ready_dex_files,
+        total_dex_files,
+    });
+}
+
+fn report_dex_inflated(
+    callback: Option<&(dyn Fn(ExportProgress) + Send + Sync)>,
+    workers: &PipelineWorkers,
+    total_dex_files: usize,
+    number: u32,
+) {
+    let inflated_dex_files = workers.inflate_completed.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Some(callback) = callback {
+        callback(ExportProgress::DexInflated {
+            inflated_dex_files,
+            total_dex_files,
+            dex_number: number,
+            inflate_workers: workers.inflating.load(Ordering::Relaxed),
+        });
+    }
+}
+
+fn report_dex_working(
+    callback: Option<&(dyn Fn(ExportProgress) + Send + Sync)>,
+    workers: &PipelineWorkers,
+    total_dex_files: usize,
+    number: u32,
+) {
+    let Some(callback) = callback else {
+        return;
+    };
+    let (busy_workers, idle_workers, decompile_workers, decompile_dex_files, inflate_workers, _, _) =
+        workers.snapshot();
+    let started_dex_files = workers.started_dexes.fetch_add(1, Ordering::Relaxed) + 1;
+    callback(ExportProgress::DexWorking {
+        started_dex_files,
+        total_dex_files,
+        dex_number: number,
+        busy_workers,
+        idle_workers,
+        decompile_workers,
+        decompile_dex_files,
+        inflate_workers,
+    });
+}
+
 fn report_apk_progress(
     callback: Option<&(dyn Fn(ExportProgress) + Send + Sync)>,
     completed: usize,
     total: usize,
     number: u32,
     duration: std::time::Duration,
+    workers: Option<&PipelineWorkers>,
 ) {
     if let Some(callback) = callback {
+        let (
+            busy_workers,
+            idle_workers,
+            decompile_workers,
+            decompile_dex_files,
+            inflate_workers,
+            _,
+            _,
+        ) = workers
+            .map(PipelineWorkers::snapshot)
+            .unwrap_or((0, 0, 0, 0, 0, 0, 0));
         callback(ExportProgress::DexCompleted {
             completed_dex_files: completed,
             total_dex_files: total,
             dex_number: number,
             dex_duration: duration,
+            busy_workers,
+            idle_workers,
+            decompile_workers,
+            decompile_dex_files,
+            inflate_workers,
         });
     }
 }
 
 fn read_apk_dex(
-    apk: &mut std::fs::File,
+    apk: &[u8],
     entry: DexZipEntry,
     decompressor: &mut libdeflater::Decompressor,
 ) -> crate::Result<Vec<u8>> {
@@ -528,9 +915,11 @@ fn read_apk_dex(
     })?;
     let uncompressed_size = usize::try_from(entry.uncompressed_size)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "DEX is too large"))?;
-    apk.seek(SeekFrom::Start(entry.data_start))?;
-    let mut compressed = vec![0; compressed_size];
-    apk.read_exact(&mut compressed)?;
+    let data_start = usize::try_from(entry.data_start)
+        .map_err(|_| std::io::Error::other("DEX data offset is too large"))?;
+    let compressed = apk
+        .get(data_start..data_start + compressed_size)
+        .ok_or_else(|| std::io::Error::other("truncated DEX ZIP payload"))?;
     let dex_bytes = if entry.compression == 0 {
         if compressed_size != uncompressed_size {
             return Err(std::io::Error::new(
@@ -539,11 +928,11 @@ fn read_apk_dex(
             )
             .into());
         }
-        compressed
+        compressed.to_vec()
     } else if entry.compression == 8 {
         let mut output = vec![0; uncompressed_size];
         let written = decompressor
-            .deflate_decompress(&compressed, &mut output)
+            .deflate_decompress(compressed, &mut output)
             .map_err(std::io::Error::other)?;
         if written != uncompressed_size {
             return Err(std::io::Error::new(
@@ -573,122 +962,237 @@ fn read_apk_dex(
     Ok(dex_bytes)
 }
 
-fn process_apk_dexes_parallel<T, F>(
+fn process_apk_parallel<F>(
     input: &Path,
     thread_count: usize,
-    progress_callback: Option<&(dyn Fn(ExportProgress) + Send + Sync)>,
-    process: F,
-) -> crate::Result<Vec<T>>
-where
-    T: Send,
-    F: Fn(&[u8], usize) -> crate::Result<T> + Sync,
-{
-    let dex_entries = apk_dex_entries(input)?;
-
-    let worker_count = thread_count.min(dex_entries.len()).max(1);
-    let threads_per_dex = if dex_entries.len() == 1 {
-        thread_count
-    } else {
-        1
-    };
-    let next = AtomicUsize::new(0);
-    let completed_count = AtomicUsize::new(0);
-    if let Some(callback) = progress_callback {
-        callback(ExportProgress::Started {
-            total_dex_files: dex_entries.len(),
-            worker_count,
-        });
-    }
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            let dex_entries = &dex_entries;
-            let next = &next;
-            let completed_count = &completed_count;
-            let process = &process;
-            handles.push(scope.spawn(move || {
-                let mut apk = std::fs::File::open(input)?;
-                let mut decompressor = libdeflater::Decompressor::new();
-                let mut completed = Vec::new();
-                loop {
-                    let position = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(entry) = dex_entries.get(position).copied() else {
-                        break;
-                    };
-                    let started = std::time::Instant::now();
-                    let dex_bytes = read_apk_dex(&mut apk, entry, &mut decompressor)?;
-                    completed.push((position, process(&dex_bytes, threads_per_dex)?));
-                    let completed = completed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    report_apk_progress(
-                        progress_callback,
-                        completed,
-                        dex_entries.len(),
-                        entry.number,
-                        started.elapsed(),
-                    );
-                }
-                Ok::<_, crate::Error>(completed)
-            }));
-        }
-
-        let mut ordered: Vec<Option<T>> = std::iter::repeat_with(|| None)
-            .take(dex_entries.len())
-            .collect();
-        for handle in handles {
-            let completed = handle
-                .join()
-                .map_err(|_| std::io::Error::other("APK decompiler worker panicked"))??;
-            for (position, result) in completed {
-                ordered[position] = Some(result);
-            }
-        }
-        ordered
-            .into_iter()
-            .map(|result| {
-                result.ok_or_else(|| {
-                    std::io::Error::other("APK decompiler worker returned no result").into()
-                })
-            })
-            .collect()
-    })
-}
-
-fn export_apk_to_directory(
-    input: &Path,
-    output_directory: &Path,
-    thread_count: Option<usize>,
     include_annotations: bool,
     progress_callback: Option<&(dyn Fn(ExportProgress) + Send + Sync)>,
-) -> crate::Result<(usize, usize)> {
-    let dex_entries = apk_dex_entries(input)?;
-
+    emit_chunk: F,
+) -> crate::Result<(usize, usize)>
+where
+    F: Fn(u32, usize, Vec<(String, String)>) -> crate::Result<()> + Sync,
+{
+    let apk: Arc<[u8]> = std::fs::read(input)?.into();
+    let dex_entries = apk_dex_entries(&apk)?;
+    let total_dex_files = dex_entries.len();
     if let Some(callback) = progress_callback {
         callback(ExportProgress::Started {
-            total_dex_files: dex_entries.len(),
-            worker_count: thread_count.unwrap_or(1),
+            total_dex_files,
+            worker_count: thread_count,
         });
     }
-    let mut apk = std::fs::File::open(input)?;
-    let mut decompressor = libdeflater::Decompressor::new();
-    let mut class_count = 0;
-    for (position, entry) in dex_entries.iter().copied().enumerate() {
-        let started = std::time::Instant::now();
-        let dex_bytes = read_apk_dex(&mut apk, entry, &mut decompressor)?;
-        class_count += export_dex_to_directory(
-            &dex_bytes,
-            output_directory,
-            thread_count,
-            include_annotations,
-        )?;
-        report_apk_progress(
-            progress_callback,
-            position + 1,
-            dex_entries.len(),
-            entry.number,
-            started.elapsed(),
-        );
-    }
-    Ok((dex_entries.len(), class_count))
+
+    let inflate_limit = thread_count
+        .saturating_sub(thread_count.min(APK_MAX_DECOMPILE_WORKERS))
+        .max(1);
+    let tasks: SharedPipelineTasks = Arc::new((
+        Mutex::new(PipelineTaskState {
+            inflate: dex_entries.into_iter().collect(),
+            decompile: VecDeque::new(),
+            closed: false,
+            active_inflaters: 0,
+            inflate_limit,
+        }),
+        Condvar::new(),
+    ));
+    let pipeline = Arc::new(PipelineState {
+        error: Mutex::new(None),
+    });
+    let completion: CompletionState = Arc::new((Mutex::new(0), Condvar::new()));
+    let workers = Arc::new(PipelineWorkers {
+        budget: thread_count,
+        inflating: AtomicUsize::new(0),
+        inflate_completed: AtomicUsize::new(0),
+        decompiling: AtomicUsize::new(0),
+        decompiling_dexes: AtomicUsize::new(0),
+        started_dexes: AtomicUsize::new(0),
+        queued_dex: AtomicUsize::new(total_dex_files),
+        ready_dex: AtomicUsize::new(0),
+        last_report: Mutex::new(None),
+    });
+    let class_count = Arc::new(AtomicUsize::new(0));
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(thread_count);
+        for _ in 0..thread_count {
+            let tasks = Arc::clone(&tasks);
+            let pipeline = Arc::clone(&pipeline);
+            let completion = Arc::clone(&completion);
+            let workers = Arc::clone(&workers);
+            let class_count = Arc::clone(&class_count);
+            let apk = Arc::clone(&apk);
+            let emit_chunk = &emit_chunk;
+            handles.push(scope.spawn(move || {
+                let mut decompressor = libdeflater::Decompressor::new();
+                while let Some(task) = pipeline_pop(&tasks) {
+                    match task {
+                        PipelineTask::Inflate(entry) => {
+                            workers.queued_dex.fetch_sub(1, Ordering::Relaxed);
+                            workers.inflating.fetch_add(1, Ordering::Relaxed);
+                            report_pipeline_activity(progress_callback, &workers, total_dex_files);
+                            let started = std::time::Instant::now();
+                            let result =
+                                read_apk_dex(&apk, entry, &mut decompressor).and_then(|bytes| {
+                                    let decompiler =
+                                        Arc::new(Decompiler::parse_owned(Arc::from(bytes))?);
+                                    let classes = decompiler.dex().classes().len();
+                                    let chunks = classes.div_ceil(APK_CLASS_CHUNK_SIZE);
+                                    if chunks == 0 {
+                                        return Ok(false);
+                                    }
+                                    workers.ready_dex.fetch_add(1, Ordering::Relaxed);
+                                    let dex = Arc::new(ReadyDex {
+                                        number: entry.number,
+                                        started,
+                                        decompiler,
+                                        active_decompilers: AtomicUsize::new(0),
+                                        working_reported: AtomicBool::new(false),
+                                        output: Mutex::new(DexOutputState {
+                                            pending_chunks: chunks,
+                                            reported_complete: false,
+                                        }),
+                                    });
+                                    for start in (0..classes).step_by(APK_CLASS_CHUNK_SIZE) {
+                                        pipeline_push(
+                                            &tasks,
+                                            PipelineTask::Decompile(
+                                                ClassJob {
+                                                    dex: Arc::clone(&dex),
+                                                    range: start
+                                                        ..(start + APK_CLASS_CHUNK_SIZE)
+                                                            .min(classes),
+                                                },
+                                                false,
+                                            ),
+                                        );
+                                    }
+                                    Ok(true)
+                                });
+                            workers.inflating.fetch_sub(1, Ordering::Relaxed);
+                            pipeline_finish_inflate(&tasks);
+                            match result {
+                                Ok(prepared) => {
+                                    report_dex_inflated(
+                                        progress_callback,
+                                        &workers,
+                                        total_dex_files,
+                                        entry.number,
+                                    );
+                                    if prepared {
+                                        continue;
+                                    }
+                                    if complete_apk_dex(
+                                        &completion,
+                                        progress_callback,
+                                        total_dex_files,
+                                        entry.number,
+                                        started.elapsed(),
+                                        Some(&workers),
+                                    ) == total_dex_files
+                                    {
+                                        pipeline_close(&tasks);
+                                    }
+                                }
+                                Err(error) => {
+                                    pipeline.record(error);
+                                    if complete_apk_dex(
+                                        &completion,
+                                        progress_callback,
+                                        total_dex_files,
+                                        entry.number,
+                                        started.elapsed(),
+                                        Some(&workers),
+                                    ) == total_dex_files
+                                    {
+                                        pipeline_close(&tasks);
+                                    }
+                                }
+                            }
+                        }
+                        PipelineTask::Decompile(job, first_for_dex) => {
+                            if first_for_dex {
+                                workers.decompiling_dexes.fetch_add(1, Ordering::Relaxed);
+                            }
+                            workers.decompiling.fetch_add(1, Ordering::Relaxed);
+                            if !job.dex.working_reported.swap(true, Ordering::Relaxed) {
+                                report_dex_working(
+                                    progress_callback,
+                                    &workers,
+                                    total_dex_files,
+                                    job.dex.number,
+                                );
+                            }
+                            report_pipeline_activity(progress_callback, &workers, total_dex_files);
+                            let dex = job.dex;
+                            let range = job.range;
+                            let start_class = range.start;
+                            let mut records = Vec::with_capacity(range.len());
+                            let result = dex.decompiler.decompile_class_range_for_export(
+                                range,
+                                include_annotations,
+                                |descriptor, output| {
+                                    records.push((descriptor.to_owned(), output.source));
+                                    Ok(())
+                                },
+                            );
+                            match result {
+                                Ok(count) => {
+                                    class_count.fetch_add(count, Ordering::Relaxed);
+                                }
+                                Err(error) => pipeline.record(error),
+                            }
+                            if let Err(error) = emit_chunk(dex.number, start_class, records) {
+                                pipeline.record(error);
+                            }
+                            let completed_dex = {
+                                let mut output =
+                                    dex.output.lock().expect("DEX output mutex poisoned");
+                                output.pending_chunks -= 1;
+                                if output.pending_chunks == 0 && !output.reported_complete {
+                                    output.reported_complete = true;
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            workers.decompiling.fetch_sub(1, Ordering::Relaxed);
+                            if pipeline_finish_decompile(&tasks, &dex) {
+                                workers.decompiling_dexes.fetch_sub(1, Ordering::Relaxed);
+                            }
+                            if completed_dex {
+                                workers.ready_dex.fetch_sub(1, Ordering::Relaxed);
+                                if complete_apk_dex(
+                                    &completion,
+                                    progress_callback,
+                                    total_dex_files,
+                                    dex.number,
+                                    dex.started.elapsed(),
+                                    Some(&workers),
+                                ) == total_dex_files
+                                {
+                                    pipeline_close(&tasks);
+                                }
+                            }
+                        }
+                    }
+                    report_pipeline_activity(progress_callback, &workers, total_dex_files);
+                }
+                Ok::<_, crate::Error>(())
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| std::io::Error::other("APK pipeline worker panicked"))??;
+        }
+        Ok::<_, crate::Error>(())
+    })?;
+
+    let classes = class_count.load(Ordering::Relaxed);
+    Arc::try_unwrap(pipeline)
+        .expect("pipeline state still referenced")
+        .finish()?;
+    Ok((total_dex_files, classes))
 }
 
 fn export_apk_parallel_to_directory(
@@ -698,20 +1202,18 @@ fn export_apk_parallel_to_directory(
     include_annotations: bool,
     progress_callback: Option<&(dyn Fn(ExportProgress) + Send + Sync)>,
 ) -> crate::Result<(usize, usize)> {
-    let counts = process_apk_dexes_parallel(
+    process_apk_parallel(
         input,
         thread_count,
+        include_annotations,
         progress_callback,
-        |dex_bytes, threads_per_dex| {
-            export_dex_to_directory(
-                dex_bytes,
-                output_directory,
-                (threads_per_dex > 1).then_some(threads_per_dex),
-                include_annotations,
-            )
+        |_, _, records| {
+            for (descriptor, source) in records {
+                write_java_class(output_directory, &descriptor, &source)?;
+            }
+            Ok(())
         },
-    )?;
-    Ok((counts.len(), counts.into_iter().sum()))
+    )
 }
 
 fn write_source_outputs<W: Write>(
@@ -764,21 +1266,27 @@ fn decompile_dex_binary(
 
 fn cli_progress(progress: ExportProgress) {
     match progress {
+        ExportProgress::Activity { .. } => {}
+        ExportProgress::DexInflated { .. } => {}
         ExportProgress::Started {
             total_dex_files,
             worker_count,
         } => eprintln!("APK export: {total_dex_files} DEX files, {worker_count} worker(s)"),
-        ExportProgress::DexCompleted {
-            completed_dex_files,
+        ExportProgress::DexWorking {
+            started_dex_files,
             total_dex_files,
             dex_number,
-            dex_duration,
+            busy_workers,
+            idle_workers,
+            decompile_workers,
+            decompile_dex_files,
+            inflate_workers,
         } => eprintln!(
-            "[apk {completed_dex_files}/{total_dex_files} {:5.1}%] {} complete in {:.3}s",
+            "[apk {started_dex_files}/{total_dex_files} {:5.1}% working] {} | busy={busy_workers} idle={idle_workers} decompile_total={decompile_workers} decompile_dex={decompile_dex_files} per_dex_cap={APK_MAX_DECOMPILE_WORKERS} inflate={inflate_workers}",
             progress.percentage(),
             dex_entry_name(dex_number),
-            dex_duration.as_secs_f64(),
         ),
+        ExportProgress::DexCompleted { .. } => {}
     }
 }
 
@@ -792,7 +1300,9 @@ fn export_binary(input: &Path, options: ExportOptions) -> crate::Result<()> {
 
 /// Exports every class from a DEX or APK into package directories as one `.java` file per class.
 ///
-/// Annotations are included by default through [`ExportOptions::default`].
+/// Annotations are included by default through [`ExportOptions::default`]. For
+/// a parallel APK export, the file is loaded once and the requested global
+/// worker budget shares DEX preparation and class decompile/write tasks.
 pub fn export_to_directory(
     input: impl AsRef<Path>,
     output_directory: impl AsRef<Path>,
@@ -807,23 +1317,13 @@ pub fn export_to_directory(
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case(OsStr::new("apk")))
     {
-        if let Some(thread_count) = thread_count {
-            export_apk_parallel_to_directory(
-                input,
-                output_directory,
-                thread_count,
-                options.include_annotations,
-                options.progress_callback.as_deref(),
-            )?
-        } else {
-            export_apk_to_directory(
-                input,
-                output_directory,
-                None,
-                options.include_annotations,
-                options.progress_callback.as_deref(),
-            )?
-        }
+        export_apk_parallel_to_directory(
+            input,
+            output_directory,
+            thread_count.unwrap_or(1),
+            options.include_annotations,
+            options.progress_callback.as_deref(),
+        )?
     } else {
         let bytes = std::fs::read(input)?;
         (
@@ -846,7 +1346,10 @@ pub fn export_to_directory(
 /// Writes all decompiled classes to an `RGOUT001` stream.
 ///
 /// This is primarily useful for bulk integrations that want to avoid creating
-/// hundreds of thousands of files. Annotations are included by default.
+/// hundreds of thousands of files. APK input uses the same inflate, parse, and
+/// class-task pipeline as [`export_to_directory`]; indexed class chunks are
+/// buffered only at the final sink so records can be emitted in deterministic
+/// DEX/class order. Annotations are included by default.
 pub fn export_to_writer(
     input: impl AsRef<Path>,
     output: &mut impl Write,
@@ -858,71 +1361,49 @@ pub fn export_to_writer(
     let apk = input
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case(OsStr::new("apk")));
-    let (dex_files, dex_outputs) = if apk {
-        let dex_outputs = if let Some(thread_count) = thread_count {
-            process_apk_dexes_parallel(
-                input,
-                thread_count,
-                options.progress_callback.as_deref(),
-                |dex_bytes, threads_per_dex| {
-                    decompile_dex_binary(dex_bytes, threads_per_dex, options.include_annotations)
-                },
-            )?
-        } else {
-            let dex_entries = apk_dex_entries(input)?;
-            if let Some(callback) = options.progress_callback.as_deref() {
-                callback(ExportProgress::Started {
-                    total_dex_files: dex_entries.len(),
-                    worker_count: 1,
-                });
-            }
-            let mut apk = std::fs::File::open(input)?;
-            let mut decompressor = libdeflater::Decompressor::new();
-            let mut outputs = Vec::with_capacity(dex_entries.len());
-            for (position, entry) in dex_entries.iter().copied().enumerate() {
-                let dex_started = std::time::Instant::now();
-                let dex_bytes = read_apk_dex(&mut apk, entry, &mut decompressor)?;
-                outputs.push(decompile_dex_binary(
-                    &dex_bytes,
-                    1,
-                    options.include_annotations,
-                )?);
-                report_apk_progress(
-                    options.progress_callback.as_deref(),
-                    position + 1,
-                    dex_entries.len(),
-                    entry.number,
-                    dex_started.elapsed(),
-                );
-            }
-            outputs
-        };
-        (dex_outputs.len(), dex_outputs)
+    let (dex_files, classes, records, direct_payload) = if apk {
+        let records = Mutex::new(BTreeMap::<
+            (u32, usize),
+            Vec<(String, String)>,
+        >::new());
+        let (dex_files, classes) = process_apk_parallel(
+            input,
+            thread_count.unwrap_or(1),
+            options.include_annotations,
+            options.progress_callback.as_deref(),
+            |dex_number, start_class, chunk| {
+                records
+                    .lock()
+                    .expect("RGOUT record mutex poisoned")
+                    .insert((dex_number, start_class), chunk);
+                Ok(())
+            },
+        )?;
+        let ordered = records
+            .into_inner()
+            .expect("RGOUT record mutex poisoned");
+        (dex_files, classes, Some(ordered), None)
     } else {
         let bytes = std::fs::read(input)?;
-        (
-            1,
-            vec![decompile_dex_binary(
-                &bytes,
-                thread_count.unwrap_or(1),
-                options.include_annotations,
-            )?],
-        )
+        let dex = decompile_dex_binary(
+            &bytes,
+            thread_count.unwrap_or(1),
+            options.include_annotations,
+        )?;
+        (1, dex.class_count as usize, None, Some(dex.payload))
     };
-    let classes = dex_outputs.iter().try_fold(0_usize, |count, dex| {
-        count.checked_add(dex.class_count as usize).ok_or_else(|| {
-            crate::Error::from(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "too many classes",
-            ))
-        })
-    })?;
     let duration = started.elapsed();
     output.write_all(b"RGOUT001")?;
     output.write_all(&duration.as_secs_f64().to_le_bytes())?;
     output.write_all(&(classes as u32).to_le_bytes())?;
-    for dex in dex_outputs {
-        output.write_all(&dex.payload)?;
+    if let Some(records) = records {
+        for (_, chunk) in records {
+            for (descriptor, source) in chunk {
+                write_class_record(output, &descriptor, &source)?;
+            }
+        }
+    } else if let Some(payload) = direct_payload {
+        output.write_all(&payload)?;
     }
     Ok(ExportSummary {
         dex_files,
@@ -1085,7 +1566,9 @@ pub fn run() -> crate::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dex_entry_number, java_relative_path, parse_thread_count};
+    use super::{
+        default_thread_count_for, dex_entry_number, java_relative_path, parse_thread_count,
+    };
     use std::ffi::OsStr;
     use std::path::Path;
 
@@ -1116,5 +1599,14 @@ mod tests {
         assert_eq!(parse_thread_count(OsStr::new("8")), Some(8));
         assert_eq!(parse_thread_count(OsStr::new("0")), None);
         assert_eq!(parse_thread_count(OsStr::new("output")), None);
+    }
+
+    #[test]
+    fn default_parallelism_uses_half_the_available_logical_cpus() {
+        assert_eq!(default_thread_count_for(1), 1);
+        assert_eq!(default_thread_count_for(2), 1);
+        assert_eq!(default_thread_count_for(3), 1);
+        assert_eq!(default_thread_count_for(4), 2);
+        assert_eq!(default_thread_count_for(20), 10);
     }
 }

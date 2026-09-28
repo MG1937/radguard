@@ -42,7 +42,7 @@ target/release/radguard
 # Export an APK to package directories and individual .java files
 ./target/release/radguard export-all app.apk output
 
-# Parallel export, automatically using all available logical CPUs
+# Parallel export, automatically using half the available logical CPUs
 ./target/release/radguard export-all-parallel app.apk output
 
 # Parallel export with an explicit worker count

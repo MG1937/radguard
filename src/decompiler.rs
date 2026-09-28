@@ -28,6 +28,12 @@ impl<'a> Decompiler<'a> {
         })
     }
 
+    pub(crate) fn parse_owned(dex_bytes: std::sync::Arc<[u8]>) -> Result<Decompiler<'static>> {
+        Ok(Decompiler {
+            dex: DexFile::parse_owned(dex_bytes)?,
+        })
+    }
+
     pub fn dex(&self) -> &DexFile<'a> {
         &self.dex
     }
@@ -103,6 +109,35 @@ impl<'a> Decompiler<'a> {
             source: output.source,
             classes,
         })
+    }
+
+    /// Decompile one scheduler-owned class range. APK pipeline workers use this
+    /// primitive so every DEX shares one global class-worker pool rather than
+    /// creating nested pools per DEX.
+    pub(crate) fn decompile_class_range_for_export<F>(
+        &self,
+        range: std::ops::Range<usize>,
+        include_annotations: bool,
+        mut visit: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str, SourceOutput) -> Result<()>,
+    {
+        let classes = self
+            .dex
+            .classes()
+            .get(range.clone())
+            .ok_or_else(|| Error::data(0, "APK class job has an invalid class range"))?;
+        for class in classes {
+            let descriptor = self.dex.class_descriptor(class)?;
+            let output = if include_annotations {
+                self.write_class::<false, true>(class)?
+            } else {
+                self.write_class::<false, false>(class)?
+            };
+            visit(descriptor, output)?;
+        }
+        Ok(range.len())
     }
 
     pub fn decompile_all_parallel(

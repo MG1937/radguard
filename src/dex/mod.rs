@@ -202,8 +202,23 @@ pub(crate) struct FieldMetadata {
 }
 
 #[derive(Debug)]
+enum DexBytes<'a> {
+    Borrowed(&'a [u8]),
+    Shared(Arc<[u8]>),
+}
+
+impl DexBytes<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(data) => data,
+            Self::Shared(data) => data,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct DexFile<'a> {
-    data: &'a [u8],
+    data: DexBytes<'a>,
     pub header: Header,
     strings: Vec<String>,
     types: Vec<u32>,
@@ -273,7 +288,7 @@ impl<'a> DexFile<'a> {
         }
 
         Ok(Self {
-            data,
+            data: DexBytes::Borrowed(data),
             header,
             strings,
             types,
@@ -308,7 +323,7 @@ impl<'a> DexFile<'a> {
     }
 
     pub(crate) fn byte_len(&self) -> usize {
-        self.data.len()
+        self.data.as_slice().len()
     }
 
     pub fn classes(&self) -> &[ClassDef] {
@@ -356,11 +371,14 @@ impl<'a> DexFile<'a> {
     }
 
     pub fn field(&self, index: u32) -> Result<ResolvedField<'_>> {
-        let field = self.field_metadata.get(index as usize).ok_or(Error::InvalidIndex {
-            table: "field",
-            index,
-            len: self.fields.len(),
-        })?;
+        let field = self
+            .field_metadata
+            .get(index as usize)
+            .ok_or(Error::InvalidIndex {
+                table: "field",
+                index,
+                len: self.fields.len(),
+            })?;
         Ok(ResolvedField {
             class: field.class.as_ref(),
             ty: field.ty.as_ref(),
@@ -429,11 +447,11 @@ impl<'a> DexFile<'a> {
             })
     }
 
-    pub fn code(&self, method: &EncodedMethod) -> Result<Option<CodeItem<'a>>> {
+    pub fn code(&self, method: &EncodedMethod) -> Result<Option<CodeItem<'_>>> {
         if method.code_off == 0 {
             return Ok(None);
         }
-        parse_code_item(self.data, method.code_off)
+        parse_code_item(self.data.as_slice(), method.code_off)
     }
 
     pub fn method_annotations(
@@ -445,9 +463,9 @@ impl<'a> DexFile<'a> {
             return Ok(annotations);
         }
         let directory = class.annotations_off as usize;
-        let fields_size = read_u32(self.data, directory + 4)? as usize;
-        let methods_size = read_u32(self.data, directory + 8)? as usize;
-        let parameters_size = read_u32(self.data, directory + 12)? as usize;
+        let fields_size = read_u32(self.data.as_slice(), directory + 4)? as usize;
+        let methods_size = read_u32(self.data.as_slice(), directory + 8)? as usize;
+        let parameters_size = read_u32(self.data.as_slice(), directory + 12)? as usize;
         let field_bytes = fields_size
             .checked_mul(8)
             .ok_or_else(|| Error::data(directory, "field annotation table size overflow"))?;
@@ -462,7 +480,7 @@ impl<'a> DexFile<'a> {
             .checked_mul(8)
             .ok_or_else(|| Error::data(directory, "parameter annotation table size overflow"))?;
         require_range(
-            self.data,
+            self.data.as_slice(),
             method_start,
             method_bytes
                 .checked_add(parameter_bytes)
@@ -470,12 +488,48 @@ impl<'a> DexFile<'a> {
         )?;
         for index in 0..methods_size {
             let entry = method_start + index * 8;
-            let method_idx = read_u32(self.data, entry)?;
+            let method_idx = read_u32(self.data.as_slice(), entry)?;
             check_index("method", method_idx, self.methods.len())?;
-            let set_off = read_u32(self.data, entry + 4)?;
-            annotations.insert(method_idx, parse_annotation_set(self.data, set_off)?);
+            let set_off = read_u32(self.data.as_slice(), entry + 4)?;
+            annotations.insert(
+                method_idx,
+                parse_annotation_set(self.data.as_slice(), set_off)?,
+            );
         }
         Ok(annotations)
+    }
+}
+
+impl DexFile<'static> {
+    /// Parse an owned buffer that may be retained by asynchronous class jobs.
+    pub fn parse_owned(data: Arc<[u8]>) -> Result<Self> {
+        let parsed: DexFile<'_> = DexFile::parse(data.as_ref())?;
+        let DexFile {
+            data: _,
+            header,
+            strings,
+            types,
+            protos,
+            proto_metadata,
+            fields,
+            field_metadata,
+            methods,
+            classes,
+            class_lookup,
+        } = parsed;
+        Ok(Self {
+            data: DexBytes::Shared(data),
+            header,
+            strings,
+            types,
+            protos,
+            proto_metadata,
+            fields,
+            field_metadata,
+            methods,
+            classes,
+            class_lookup,
+        })
     }
 }
 
@@ -967,10 +1021,7 @@ fn parse_annotation_set(data: &[u8], offset: u32) -> Result<Vec<EncodedAnnotatio
     Ok(annotations)
 }
 
-fn parse_encoded_annotation(
-    cursor: &mut Cursor<'_>,
-    depth: usize,
-) -> Result<EncodedAnnotation> {
+fn parse_encoded_annotation(cursor: &mut Cursor<'_>, depth: usize) -> Result<EncodedAnnotation> {
     if depth >= MAX_ENCODED_VALUE_DEPTH {
         return Err(Error::data(
             cursor.offset,

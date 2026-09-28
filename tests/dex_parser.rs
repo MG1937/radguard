@@ -5,6 +5,7 @@ use radguard::graph::Graph;
 use radguard::ir::opcode::lower_method;
 use radguard::{Decompiler, DexFile, Error};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 fn sample_bytes() -> Vec<u8> {
     std::fs::read("tests/fixtures/sample.dex").expect("read phase-one sample")
@@ -35,6 +36,20 @@ fn parses_phase_one_sample_index_and_class_data() {
         .sum();
     assert_eq!(encoded_fields, 1_275);
     assert_eq!(encoded_methods, 2_364);
+}
+
+#[test]
+fn owned_dex_supports_shared_pipeline_backing_bytes() {
+    let dex = DexFile::parse_owned(Arc::<[u8]>::from(sample_bytes())).expect("parse owned DEX");
+    assert_eq!(dex.classes().len(), 536);
+    let class = dex
+        .class("Lkotlinx/coroutines/flow/AbstractFlow$collect$1;")
+        .expect("known class");
+    assert!(
+        dex.code(class.methods().next().expect("constructor"))
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]

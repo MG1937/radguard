@@ -70,7 +70,7 @@ println!(
 );
 ```
 
-Use all available logical CPUs:
+Use half the available logical CPUs:
 
 ```rust
 let summary = export_to_directory(
@@ -87,9 +87,14 @@ let options = ExportOptions::default().with_threads(8);
 let summary = export_to_directory("app.apk", "output", options)?;
 ```
 
-For APKs with multiple DEX files, the worker budget is used across DEX files. Different
-`classesN.dex` entries are decompressed with libdeflate and decompiled concurrently. A one-DEX
-APK uses the worker budget for class-level parallelism.
+For APKs with multiple DEX files, `thread_count` is one global worker budget. The APK is loaded
+once, exact `classes*.dex` entries are found inside the validated Central Directory, and one shared
+task pool performs DEX decompression/parsing and class decompilation. An individual DEX receives at
+most eight concurrent class tasks, while different DEX files can run concurrently.
+
+Both `export_to_directory` and `export_to_writer` invoke this same APK pipeline. They differ only in
+the output sink: directory export writes each class immediately, while writer export buffers indexed
+class chunks and emits them in deterministic DEX/class order.
 
 ## Progress callback
 
@@ -123,7 +128,8 @@ export_to_directory("app.apk", "output", options)?;
 ## Export to an in-memory or custom writer
 
 `export_to_writer` writes the stable `RGOUT001` aggregate stream. This avoids creating one file
-per class and accepts any `std::io::Write` implementation:
+per class and accepts any `std::io::Write` implementation. APK parsing, DEX decompression, and class
+decompilation use exactly the same pipeline as `export_to_directory`; only the final sink differs:
 
 ```rust
 use radguard::cli::{ExportOptions, export_to_writer};
