@@ -156,8 +156,11 @@ pub struct CodeItem<'a> {
 impl CodeItem<'_> {
     pub fn instruction_units(&self) -> impl ExactSizeIterator<Item = u16> + '_ {
         self.insns
-            .chunks_exact(2)
-            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .copied()
+            .map(u16::from_le_bytes)
     }
 
     pub fn instruction_bytes(&self) -> &[u8] {
