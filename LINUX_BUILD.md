@@ -70,7 +70,7 @@ Or run each stage manually:
 cargo test --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo build --release --locked
-python3 -S tests/quality_gate.py --phase 2 --no-build --rust-bin target/release/radguard
+python3 -S tests/quality_gate.py --phase 2 --diff-workers "$(nproc)" --no-build --rust-bin target/release/radguard
 ```
 
 The Python quality gate uses only the checked-in frozen `pickle.gz` DAD cache and its frozen

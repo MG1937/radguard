@@ -19,8 +19,14 @@ $RustBin = if ($IsWindows -or $env:OS -eq "Windows_NT") {
     "target/release/radguard"
 }
 
-Write-Host "==> Frozen DAD quality gates (Phase 1 = 0, Phase 2 <= 70)"
-python -S tests/quality_gate.py --phase 2 --no-build --rust-bin $RustBin
+$DiffWorkers = if ($env:RADGUARD_DIFF_WORKERS) {
+    $env:RADGUARD_DIFF_WORKERS
+} else {
+    [Environment]::ProcessorCount
+}
+
+Write-Host "==> Frozen DAD quality gates (Phase 1 = 0, Phase 2 <= 70; $DiffWorkers diff workers)"
+python -S tests/quality_gate.py --phase 2 --diff-workers $DiffWorkers --no-build --rust-bin $RustBin
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host "==> All gates passed"

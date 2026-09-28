@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import ctypes
 import difflib
 import gzip
@@ -2873,6 +2874,119 @@ def write_difference(
     )
 
 
+def compare_class(task):
+    (
+        name,
+        dad_source,
+        rust_source,
+        filled_string_ranges,
+        boolean_array_loads,
+        object_array_loads,
+        primitive_array_loads,
+        inline_consts,
+        split_inline_consts,
+        catch_types,
+        dad_type_corrections,
+    ) = task
+    dad_normalized, rust_normalized = normalize_filled_string_ranges(
+        normalize_dad_type_names(dad_source or "", dad_type_corrections),
+        rust_source or "",
+        filled_string_ranges,
+    )
+    dad_normalized, rust_normalized = normalize_dad_catch_types(
+        dad_normalized,
+        rust_normalized,
+        catch_types,
+    )
+    rust_semantic = semantic_source(rust_normalized, dad_source=False)
+    dad_semantic = semantic_source(dad_normalized, dad_source=True)
+    if rust_semantic != dad_semantic:
+        candidate = unwrap_dex_empty_catches(
+            rust_normalized,
+            catch_types,
+        )
+        candidate_semantic = semantic_source(candidate, dad_source=False)
+        if candidate_semantic == dad_semantic:
+            rust_semantic = candidate_semantic
+    if rust_semantic != dad_semantic:
+        candidate = normalize_dad_boolean_array_nulls(
+            dad_normalized,
+            boolean_array_loads,
+        )
+        candidate_semantic = semantic_source(candidate, dad_source=True)
+        if candidate_semantic == rust_semantic:
+            dad_semantic = candidate_semantic
+    if rust_semantic != dad_semantic:
+        candidate = normalize_dad_primitive_array_nulls(
+            dad_normalized,
+            primitive_array_loads,
+        )
+        candidate_semantic = semantic_source(candidate, dad_source=True)
+        if candidate_semantic == rust_semantic:
+            dad_semantic = candidate_semantic
+    if rust_semantic != dad_semantic:
+        candidate = normalize_dad_object_array_zeroes(
+            dad_normalized,
+            object_array_loads,
+        )
+        candidate_semantic = semantic_source(candidate, dad_source=True)
+        if candidate_semantic == rust_semantic:
+            dad_semantic = candidate_semantic
+    if rust_semantic != dad_semantic:
+        candidate = normalize_dad_inline_consts(
+            dad_normalized,
+            inline_consts,
+        )
+        candidate_semantic = semantic_source(candidate, dad_source=True)
+        if candidate_semantic == rust_semantic:
+            dad_semantic = candidate_semantic
+    if rust_semantic != dad_semantic:
+        candidate = normalize_dad_split_constant_definitions(
+            normalize_dad_split_inline_consts(
+                normalize_dad_inline_consts(
+                    dad_normalized,
+                    inline_consts,
+                ),
+                split_inline_consts,
+            ),
+            split_inline_consts,
+        )
+        candidate_semantic = semantic_source(candidate, dad_source=True)
+        if candidate_semantic == rust_semantic:
+            dad_semantic = candidate_semantic
+    if rust_semantic != dad_semantic:
+        for candidate in stable_local_alias_candidates(rust_normalized):
+            candidate_semantic = semantic_source(candidate, dad_source=False)
+            if candidate_semantic == dad_semantic:
+                rust_semantic = candidate_semantic
+                break
+    if rust_semantic != dad_semantic:
+        dad_declarations = normalize_method_local_declarations(dad_normalized)
+        rust_declarations = normalize_method_local_declarations(rust_normalized)
+        pairs = ((dad_declarations, rust_normalized), (dad_normalized, rust_declarations), (dad_declarations, rust_declarations))
+        for dad_candidate, rust_candidate in pairs:
+            candidate_dad_semantic = semantic_source(dad_candidate, dad_source=True)
+            candidate_rust_semantic = semantic_source(rust_candidate, dad_source=False)
+            if candidate_dad_semantic == candidate_rust_semantic:
+                dad_semantic = candidate_dad_semantic
+                rust_semantic = candidate_rust_semantic
+                break
+    if rust_semantic != dad_semantic:
+        candidate = normalize_lexical_scope_declarations(rust_normalized)
+        candidate_semantic = semantic_source(candidate, dad_source=False)
+        if candidate_semantic == dad_semantic:
+            rust_semantic = candidate_semantic
+    if rust_semantic != dad_semantic:
+        for candidate in lexical_scope_declaration_candidates(rust_normalized):
+            candidate_semantic = semantic_source(candidate, dad_source=False)
+            if candidate_semantic == dad_semantic:
+                rust_semantic = candidate_semantic
+                break
+    if rust_semantic == dad_semantic:
+        return None
+    return name, dad_source, rust_source, dad_semantic, rust_semantic
+
+
 def compare(
     dex_path: Path,
     executable: Path,
@@ -2882,6 +2996,7 @@ def compare(
     threads: int,
     dad_cache_dir: Path | None,
     refresh_dad_cache: bool,
+    diff_workers: int,
 ) -> tuple[int, int, float, float, list[float]]:
     dex_bytes = dex_path.read_bytes()
     dad_output, oracles, dad_seconds = decompile_dad_cached(
@@ -2917,107 +3032,34 @@ def compare(
         "dad_references=1",
         flush=True,
     )
-    for name in names:
-        dad_source = dad_output.get(name)
-        rust_source = rust.get(name)
-        dad_normalized, rust_normalized = normalize_filled_string_ranges(
-            normalize_dad_type_names(dad_source or "", dad_type_corrections),
-            rust_source or "",
+    tasks = (
+        (
+            name,
+            dad_output.get(name),
+            rust.get(name),
             filled_string_ranges.get(name, []),
-        )
-        dad_normalized, rust_normalized = normalize_dad_catch_types(
-            dad_normalized,
-            rust_normalized,
+            boolean_array_loads.get(name, []),
+            object_array_loads.get(name, []),
+            primitive_array_loads.get(name, []),
+            inline_consts.get(name, []),
+            split_inline_consts.get(name, []),
             catch_types.get(name, []),
+            dad_type_corrections,
         )
-        rust_semantic = semantic_source(rust_normalized, dad_source=False)
-        dad_semantic = semantic_source(dad_normalized, dad_source=True)
-        if rust_semantic != dad_semantic:
-            candidate = unwrap_dex_empty_catches(
-                rust_normalized,
-                catch_types.get(name, []),
-            )
-            candidate_semantic = semantic_source(candidate, dad_source=False)
-            if candidate_semantic == dad_semantic:
-                rust_semantic = candidate_semantic
-        if rust_semantic != dad_semantic:
-            candidate = normalize_dad_boolean_array_nulls(
-                dad_normalized,
-                boolean_array_loads.get(name, []),
-            )
-            candidate_semantic = semantic_source(candidate, dad_source=True)
-            if candidate_semantic == rust_semantic:
-                dad_semantic = candidate_semantic
-        if rust_semantic != dad_semantic:
-            candidate = normalize_dad_primitive_array_nulls(
-                dad_normalized,
-                primitive_array_loads.get(name, []),
-            )
-            candidate_semantic = semantic_source(candidate, dad_source=True)
-            if candidate_semantic == rust_semantic:
-                dad_semantic = candidate_semantic
-        if rust_semantic != dad_semantic:
-            candidate = normalize_dad_object_array_zeroes(
-                dad_normalized,
-                object_array_loads.get(name, []),
-            )
-            candidate_semantic = semantic_source(candidate, dad_source=True)
-            if candidate_semantic == rust_semantic:
-                dad_semantic = candidate_semantic
-        if rust_semantic != dad_semantic:
-            candidate = normalize_dad_inline_consts(
-                dad_normalized,
-                inline_consts.get(name, []),
-            )
-            candidate_semantic = semantic_source(candidate, dad_source=True)
-            if candidate_semantic == rust_semantic:
-                dad_semantic = candidate_semantic
-        if rust_semantic != dad_semantic:
-            candidate = normalize_dad_split_constant_definitions(
-                normalize_dad_split_inline_consts(
-                    normalize_dad_inline_consts(
-                        dad_normalized,
-                        inline_consts.get(name, []),
-                    ),
-                    split_inline_consts.get(name, []),
-                ),
-                split_inline_consts.get(name, []),
-            )
-            candidate_semantic = semantic_source(candidate, dad_source=True)
-            if candidate_semantic == rust_semantic:
-                dad_semantic = candidate_semantic
-        if rust_semantic != dad_semantic:
-            for candidate in stable_local_alias_candidates(rust_normalized):
-                candidate_semantic = semantic_source(candidate, dad_source=False)
-                if candidate_semantic == dad_semantic:
-                    rust_semantic = candidate_semantic
-                    break
-        if rust_semantic != dad_semantic:
-            dad_declarations = normalize_method_local_declarations(dad_normalized)
-            rust_declarations = normalize_method_local_declarations(rust_normalized)
-            pairs = ((dad_declarations, rust_normalized), (dad_normalized, rust_declarations), (dad_declarations, rust_declarations))
-            for dad_candidate, rust_candidate in pairs:
-                candidate_dad_semantic = semantic_source(dad_candidate, dad_source=True)
-                candidate_rust_semantic = semantic_source(rust_candidate, dad_source=False)
-                if candidate_dad_semantic == candidate_rust_semantic:
-                    dad_semantic = candidate_dad_semantic
-                    rust_semantic = candidate_rust_semantic
-                    break
-        if rust_semantic != dad_semantic:
-            candidate = normalize_lexical_scope_declarations(rust_normalized)
-            candidate_semantic = semantic_source(candidate, dad_source=False)
-            if candidate_semantic == dad_semantic:
-                rust_semantic = candidate_semantic
-        if rust_semantic != dad_semantic:
-            for candidate in lexical_scope_declaration_candidates(rust_normalized):
-                candidate_semantic = semantic_source(candidate, dad_source=False)
-                if candidate_semantic == dad_semantic:
-                    rust_semantic = candidate_semantic
-                    break
-        if rust_semantic == dad_semantic:
-            continue
-        mismatches += 1
-        if mismatches <= max_diff_print:
+        for name in names
+    )
+    if diff_workers == 1 or len(names) <= 1:
+        results = map(compare_class, tasks)
+        mismatch_details = [result for result in results if result is not None]
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=diff_workers) as executor:
+            results = executor.map(compare_class, tasks, chunksize=16)
+            mismatch_details = [result for result in results if result is not None]
+    mismatches = len(mismatch_details)
+    for index, (name, dad_source, rust_source, dad_semantic, rust_semantic) in enumerate(
+        mismatch_details, 1
+    ):
+        if index <= max_diff_print:
             print(
                 f"DIFF {dex_path} {name} "
                 f"dad={len(dad_source) if dad_source is not None else -1} "
@@ -3056,7 +3098,15 @@ def main() -> int:
     parser.add_argument("--rust-bin", type=Path)
     parser.add_argument("--no-build", action="store_true")
     parser.add_argument("--max-diff-print", type=int, default=20)
+    parser.add_argument(
+        "--diff-workers",
+        type=int,
+        default=os.cpu_count() or 1,
+        help="parallel class-comparison processes (default: logical CPU count)",
+    )
     args = parser.parse_args()
+    if args.diff_workers < 1:
+        parser.error("--diff-workers must be at least 1")
     validate_normalizers()
 
     executable = args.rust_bin
@@ -3089,6 +3139,7 @@ def main() -> int:
             1,
             cache_dir,
             False,
+            args.diff_workers,
         )
         ceiling = ceilings[phase]
         status = "PASS" if mismatches <= ceiling else "FAIL"

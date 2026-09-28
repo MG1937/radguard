@@ -440,12 +440,17 @@ Offline DAD quality gates:
 ```bash
 python3 tests/quality_gate.py --phase 1
 python3 tests/quality_gate.py --phase 2
+
+# Optional: explicitly select the number of class-diff worker processes
+python3 tests/quality_gate.py --phase 2 --diff-workers 8
 ```
 
 The quality gate reads the checked-in `tests/fixtures/dad_reference_cache/dad-*.pickle.gz` files. They
 contain frozen Androguard DAD source plus the frozen DEX-aware comparison oracles. The script does
 not generate DAD output and does not import or run Androguard. Phase 1 requires exactly zero
 mismatching classes. Phase 2 first runs Phase 1, then requires at most 70 mismatching classes.
+Class normalization and comparison use a process pool by default, with one worker per available
+logical CPU; use `--diff-workers N` or `RADGUARD_DIFF_WORKERS=N` to override it.
 
 The benchmark transcripts above document the current large-APK throughput results. The included
 Rust test suite covers parsing, lowering, data flow, control flow, public APIs, and parallel output.

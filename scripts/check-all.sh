@@ -29,6 +29,7 @@ fi
 echo '==> Frozen DAD quality gates (Phase 1 = 0, Phase 2 <= 70)'
 "${python_cmd[@]}" -S tests/quality_gate.py \
   --phase 2 \
+  --diff-workers "${RADGUARD_DIFF_WORKERS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}" \
   --no-build \
   --rust-bin "$rust_bin"
 
