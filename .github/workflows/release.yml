@@ -1,0 +1,240 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  quality-gate:
+    name: Full quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo build data
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches Cargo package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          if [[ "${GITHUB_REF_NAME}" != "v${package_version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${package_version}" >&2
+            exit 1
+          fi
+
+      - name: Run all gates
+        shell: bash
+        run: bash scripts/check-all.sh
+
+  linux:
+    name: Linux ${{ matrix.arch }}
+    needs: quality-gate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            compiler: native
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            compiler: aarch64-linux-gnu
+          - arch: armv7
+            target: armv7-unknown-linux-gnueabihf
+            compiler: arm-linux-gnueabihf
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross compiler
+        if: matrix.compiler != 'native'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          if [[ "${{ matrix.arch }}" == "aarch64" ]]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+            echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
+            echo 'CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
+            echo 'AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar' >> "$GITHUB_ENV"
+          else
+            sudo apt-get install -y gcc-arm-linux-gnueabihf
+            echo 'CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc' >> "$GITHUB_ENV"
+            echo 'CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc' >> "$GITHUB_ENV"
+            echo 'AR_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-ar' >> "$GITHUB_ENV"
+          fi
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="radguard-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}"
+          mkdir -p "dist/${package}"
+          cp "target/${{ matrix.target }}/release/radguard" "dist/${package}/"
+          cp README.md "dist/${package}/"
+          cp docs/RUST_API.md "dist/${package}/"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+          sha256sum "dist/${package}.tar.gz" > "dist/${package}.tar.gz.sha256"
+          rm -rf "dist/${package}"
+
+      - name: Upload Linux archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    needs: quality-gate
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+            msvc_arch: x64
+          - arch: x86
+            target: i686-pc-windows-msvc
+            msvc_arch: x86
+          - arch: aarch64
+            target: aarch64-pc-windows-msvc
+            msvc_arch: arm64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure MSVC toolchain
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        shell: pwsh
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package archive
+        shell: pwsh
+        run: |
+          $package = "radguard-$env:GITHUB_REF_NAME-windows-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path "dist/$package" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/radguard.exe" "dist/$package/"
+          Copy-Item README.md "dist/$package/"
+          Copy-Item docs/RUST_API.md "dist/$package/"
+          Compress-Archive -Path "dist/$package/*" -DestinationPath "dist/$package.zip"
+          Remove-Item -Recurse -Force "dist/$package"
+          $hash = (Get-FileHash "dist/$package.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $package.zip" | Set-Content -NoNewline "dist/$package.zip.sha256"
+
+      - name: Upload Windows archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    needs: quality-gate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
+          - arch: aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="radguard-${GITHUB_REF_NAME}-macos-${{ matrix.arch }}"
+          mkdir -p "dist/${package}"
+          cp "target/${{ matrix.target }}/release/radguard" "dist/${package}/"
+          cp README.md "dist/${package}/"
+          cp docs/RUST_API.md "dist/${package}/"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+          shasum -a 256 "dist/${package}.tar.gz" > "dist/${package}.tar.gz.sha256"
+          rm -rf "dist/${package}"
+
+      - name: Upload macOS archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - linux
+      - windows
+      - macos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Publish tagged release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true

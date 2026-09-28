@@ -1,0 +1,52 @@
+# Rust build outputs
+/target/
+
+# Autoresearch/session state
+/.auto/
+
+# Python sources, bytecode, environments, and caches
+*.py
+!/tests/quality_gate.py
+*.py[cod]
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local benchmark/reference implementation
+/dadguard_py/
+
+# Internal handoff and rolling benchmark notes
+/HANDOFF.md
+/BENCHMARK.md
+
+# Exported decompiler output
+*.rgout
+/dump*/
+/output/
+
+# Generated source bundles
+/radguard-linux-source.tar.gz
+/radguard-linux-source.tar.gz.sha256
+
+# Native crash/profiling output
+*.profraw
+*.profdata
+perf.data*
+core
+core.*
+
+# IDE and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local logs and temporary files
+*.log
+*.tmp
+*.temp

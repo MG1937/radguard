@@ -1,0 +1,44 @@
+name: Quality Gate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full-gate:
+    name: Rust tests, Clippy, and frozen DAD quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo build data
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate required fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s tests/fixtures/sample.dex
+          test -s tests/fixtures/classes5.dex
+          test -s tests/fixtures/dad_reference_cache/dad-sample.pickle.gz
+          test -s tests/fixtures/dad_reference_cache/dad-classes5.pickle.gz
+
+      - name: Run all gates
+        shell: bash
+        run: bash scripts/check-all.sh
