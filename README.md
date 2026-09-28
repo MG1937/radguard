@@ -403,7 +403,6 @@ The release workflow publishes SHA-256-checked archives for:
 | Windows | x86-64 | `x86_64-pc-windows-msvc` |
 | Windows | x86 32-bit | `i686-pc-windows-msvc` |
 | Windows | ARM64 | `aarch64-pc-windows-msvc` |
-| macOS | Intel x86-64 | `x86_64-apple-darwin` |
 | macOS | Apple Silicon | `aarch64-apple-darwin` |
 
 GitHub also generates source `.zip` and `.tar.gz` archives automatically. Release publication is
