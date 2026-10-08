@@ -322,10 +322,6 @@ impl<'a> DexFile<'a> {
         &self.methods
     }
 
-    pub(crate) fn byte_len(&self) -> usize {
-        self.data.as_slice().len()
-    }
-
     pub fn classes(&self) -> &[ClassDef] {
         &self.classes
     }

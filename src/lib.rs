@@ -11,7 +11,5 @@ pub mod types;
 pub mod writer;
 
 pub use dex::DexFile;
-pub use decompiler::{
-    decompile_dex_bytes, decompile_dex_bytes_with_metadata, Decompiler,
-};
+pub use decompiler::{Decompiler, decompile_dex_bytes};
 pub use error::{Error, Result};

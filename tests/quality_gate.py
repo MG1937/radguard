@@ -543,15 +543,27 @@ def decompile_rust(
     if class_name is not None:
         started = time.perf_counter()
         result = subprocess.run(
-            [str(executable), "decompile-dad", str(dex_path), class_name],
+            [
+                str(executable),
+                "decompile",
+                "--no-metadata",
+                str(dex_path),
+                class_name,
+            ],
             check=True,
             capture_output=True,
         )
         return {class_name: result.stdout.decode("utf-8")}, time.perf_counter() - started
     command = (
-        [str(executable), "export-all-dad", str(dex_path)]
+        [str(executable), "export-all", "--no-metadata", str(dex_path)]
         if threads == 1
-        else [str(executable), "export-all-dad-parallel", str(dex_path), str(threads)]
+        else [
+            str(executable),
+            "export-all-parallel",
+            "--no-metadata",
+            str(dex_path),
+            str(threads),
+        ]
     )
     result = subprocess.run(
         command,

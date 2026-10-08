@@ -34,20 +34,18 @@ fn main() -> radguard::Result<()> {
 }
 ```
 
-For annotation-free historical DAD rendering:
-
-```rust
-let source = radguard::cli::decompile_class_file_dad(
-    "classes.dex",
-    "Lcom/example/MainActivity;",
-)?;
-```
-
 For data already in memory, use `radguard::Decompiler` directly:
 
 ```rust
 let decompiler = radguard::Decompiler::parse(&dex_bytes)?;
-let output = decompiler.decompile_class_with_metadata("Lcom/example/MainActivity;")?;
+let output = decompiler.decompile_class("Lcom/example/MainActivity;")?;
+```
+
+Disable rendered DEX annotations on the decompiler when required:
+
+```rust
+let decompiler = radguard::Decompiler::parse(&dex_bytes)?.without_metadata();
+let output = decompiler.decompile_class("Lcom/example/MainActivity;")?;
 ```
 
 ## Export an APK or DEX as Java files
@@ -155,14 +153,14 @@ repeated class count times:
   bytes   UTF-8 Java-like source
 ```
 
-## Annotation-free DAD compatibility
+## Annotation-free output
 
-Annotations are enabled by default. Disable them only when historical DAD-compatible output is
-required:
+Metadata annotations are enabled by default. Disable them explicitly when annotation-free output
+is required:
 
 ```rust
-let options = ExportOptions::parallel().dad_compatible();
-radguard::cli::export_to_directory("app.apk", "dad-output", options)?;
+let options = ExportOptions::parallel().without_metadata();
+radguard::cli::export_to_directory("app.apk", "plain-output", options)?;
 ```
 
 ## Inspect a DEX
@@ -183,4 +181,10 @@ radguard export-all-parallel app.apk 8 output
 ```
 
 Normal `decompile`, `export-all`, and `export-all-parallel` output includes annotations.
-`decompile-dad` remains available for annotation-free single-class compatibility output.
+Pass `--no-metadata` to any of those commands for annotation-free output:
+
+```bash
+radguard decompile --no-metadata classes.dex 'Lcom/example/MainActivity;'
+radguard export-all --no-metadata app.apk output
+radguard export-all-parallel --no-metadata app.apk 8 output
+```

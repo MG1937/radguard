@@ -43,7 +43,7 @@ runtime.
 - Parallel Deflate decompression through `libdeflate`
 - Live APK/DEX progress reporting
 - Public Rust API for embedding RadGuard in other projects
-- Optional annotation-free DAD-compatible output
+- Optional annotation-free output through `--no-metadata`
 
 ## Build
 
@@ -93,7 +93,7 @@ radguard decompile classes.dex 'Lcom/example/MainActivity;'
 Annotation-free DAD-compatible output:
 
 ```bash
-radguard decompile-dad classes.dex 'Lcom/example/MainActivity;'
+radguard decompile --no-metadata classes.dex 'Lcom/example/MainActivity;'
 ```
 
 ### Export a DEX or APK as Java files
@@ -114,6 +114,13 @@ Parallel with an explicit global worker count:
 
 ```bash
 radguard export-all-parallel app.apk 8 output
+```
+
+Add `--no-metadata` to either export command when annotation-free output is required:
+
+```bash
+radguard export-all --no-metadata app.apk output
+radguard export-all-parallel --no-metadata app.apk 8 output
 ```
 
 The output follows the reconstructed package hierarchy:
@@ -182,7 +189,7 @@ Normal exports include annotations by default. Historical annotation-free DAD re
 requested explicitly:
 
 ```rust
-let options = ExportOptions::parallel().dad_compatible();
+let options = ExportOptions::parallel().without_metadata();
 ```
 
 See [docs/RUST_API.md](docs/RUST_API.md) for the complete embedding guide, progress callbacks,

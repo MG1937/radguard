@@ -256,42 +256,54 @@ fn decompiles_every_phase_one_class_with_valid_metadata_bits_ut() {
 }
 
 #[test]
-fn parallel_decompilation_preserves_class_order_and_metadata_bits_ut() {
+fn metadata_is_enabled_by_default_and_can_be_disabled() {
     let bytes = sample_bytes();
-    let decompiler = Decompiler::parse(&bytes).expect("parse sample.dex");
-    let expected = decompiler
-        .decompile_all_dad()
-        .expect("decompile sample.dex sequentially");
+    let descriptor = "Lkotlinx/coroutines/internal/ArrayQueue;";
+    let annotated = Decompiler::parse(&bytes)
+        .expect("parse sample.dex")
+        .decompile_class(descriptor)
+        .expect("decompile annotated class")
+        .expect("known class");
+    let plain = Decompiler::parse(&bytes)
+        .expect("parse sample.dex")
+        .without_metadata()
+        .decompile_class(descriptor)
+        .expect("decompile class without metadata")
+        .expect("known class");
+
+    assert!(annotated.source.contains("@Signature"));
+    assert!(!plain.source.contains("@Signature"));
+    assert!(!annotated.member_references.is_empty());
+    assert_eq!(
+        plain.member_references.len(),
+        annotated.member_references.len()
+    );
+    for reference in &plain.member_references {
+        assert!(
+            plain.source
+                .get(reference.start..reference.end)
+                .is_some_and(|text| !text.is_empty()),
+            "annotation-free output has an invalid member span"
+        );
+    }
+}
+
+#[test]
+fn parallel_decompilation_preserves_class_order_without_metadata_bits_ut() {
+    let bytes = sample_bytes();
+    let decompiler = Decompiler::parse(&bytes)
+        .expect("parse sample.dex")
+        .without_metadata();
+    let expected = decompiler.decompile_all().expect("decompile sequentially");
     let parallel = decompiler
-        .decompile_all_dad_parallel(4)
+        .decompile_all_parallel(4)
         .expect("decompile sample.dex with four workers");
     let zero_worker_fallback = decompiler
-        .decompile_all_dad_parallel(0)
+        .decompile_all_parallel(0)
         .expect("decompile sample.dex with the zero-worker fallback");
 
     for actual in [parallel, zero_worker_fallback] {
-        assert_eq!(actual.len(), expected.len());
-        for ((actual_descriptor, actual_output), (expected_descriptor, _)) in
-            actual.iter().zip(&expected)
-        {
-            assert_eq!(actual_descriptor, expected_descriptor);
-            assert!(!actual_output.source.is_empty());
-            for reference in &actual_output.member_references {
-                let text = actual_output
-                    .source
-                    .get(reference.start..reference.end)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "{actual_descriptor} has invalid member span {}..{}",
-                            reference.start, reference.end
-                        )
-                    });
-                assert!(
-                    !text.is_empty(),
-                    "{actual_descriptor} has an empty member span"
-                );
-            }
-        }
+        assert_eq!(actual, expected);
     }
 }
 

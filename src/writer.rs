@@ -23,7 +23,7 @@ pub struct MemberReference {
     pub declaration: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct SourceOutput {
     pub source: String,
     pub member_references: Vec<MemberReference>,
@@ -41,7 +41,7 @@ impl SourceOutput {
     }
 }
 
-pub struct MethodWriter<'a, const RECORD_REFERENCES: bool = true> {
+pub struct MethodWriter<'a> {
     graph: &'a Graph,
     output: SourceOutput,
     declared: Vec<bool>,
@@ -61,7 +61,7 @@ pub struct MethodWriter<'a, const RECORD_REFERENCES: bool = true> {
     this_is_super: bool,
 }
 
-impl<'a, const RECORD_REFERENCES: bool> MethodWriter<'a, RECORD_REFERENCES> {
+impl<'a> MethodWriter<'a> {
     pub fn new(graph: &'a Graph, current_class: &'a str, constructor: bool) -> Self {
         let conditions = graph
             .nodes
@@ -860,17 +860,15 @@ impl<'a, const RECORD_REFERENCES: bool> MethodWriter<'a, RECORD_REFERENCES> {
             self.write(".");
             let start = self.output.source.len();
             self.write(&method.name);
-            if RECORD_REFERENCES {
-                self.output.member_references.push(MemberReference {
-                    start,
-                    end: self.output.source.len(),
-                    kind: MemberKind::Method,
-                    class: method.class.clone(),
-                    name: method.name.clone(),
-                    descriptor: method_descriptor(method),
-                    declaration: false,
-                });
-            }
+            self.output.member_references.push(MemberReference {
+                start,
+                end: self.output.source.len(),
+                kind: MemberKind::Method,
+                class: method.class.clone(),
+                name: method.name.clone(),
+                descriptor: method_descriptor(method),
+                declaration: false,
+            });
         }
         self.write("(");
         for (index, argument) in arguments.iter().enumerate() {
@@ -991,17 +989,15 @@ impl<'a, const RECORD_REFERENCES: bool> MethodWriter<'a, RECORD_REFERENCES> {
     fn write_field_name(&mut self, field: &FieldReference, declaration: bool) {
         let start = self.output.source.len();
         self.write(field.name.as_ref());
-        if RECORD_REFERENCES {
-            self.output.member_references.push(MemberReference {
-                start,
-                end: self.output.source.len(),
-                kind: MemberKind::Field,
-                class: field.class.to_string(),
-                name: field.name.to_string(),
-                descriptor: field.ty.to_string(),
-                declaration,
-            });
-        }
+        self.output.member_references.push(MemberReference {
+            start,
+            end: self.output.source.len(),
+            kind: MemberKind::Field,
+            class: field.class.to_string(),
+            name: field.name.to_string(),
+            descriptor: field.ty.to_string(),
+            declaration,
+        });
     }
 
     fn write_indent(&mut self) {

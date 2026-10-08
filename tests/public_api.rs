@@ -1,4 +1,5 @@
 use std::fs;
+use std::process::Command;
 
 use radguard::cli::{ExportOptions, decompile_class_file, export_to_directory, export_to_writer};
 
@@ -42,4 +43,34 @@ fn public_file_api_exports_annotated_sources_and_stream() {
             .is_file()
     );
     fs::remove_dir_all(output).expect("remove temporary export");
+}
+
+#[test]
+fn cli_uses_one_command_with_metadata_enabled_by_default() {
+    let binary = env!("CARGO_BIN_EXE_radguard");
+    let descriptor = "Lkotlinx/coroutines/internal/ArrayQueue;";
+    let annotated = Command::new(binary)
+        .args(["decompile", "tests/fixtures/sample.dex", descriptor])
+        .output()
+        .expect("run annotated decompile");
+    assert!(annotated.status.success());
+    assert!(String::from_utf8_lossy(&annotated.stdout).contains("@Signature"));
+
+    let plain = Command::new(binary)
+        .args([
+            "decompile",
+            "--no-metadata",
+            "tests/fixtures/sample.dex",
+            descriptor,
+        ])
+        .output()
+        .expect("run decompile without metadata");
+    assert!(plain.status.success());
+    assert!(!String::from_utf8_lossy(&plain.stdout).contains("@Signature"));
+
+    let removed_command = Command::new(binary)
+        .args(["decompile-dad", "tests/fixtures/sample.dex", descriptor])
+        .output()
+        .expect("run removed command");
+    assert_eq!(removed_command.status.code(), Some(2));
 }

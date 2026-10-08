@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -31,12 +31,12 @@ pub type ProgressCallback = Arc<dyn Fn(ExportProgress) + Send + Sync + 'static>;
 
 /// Options shared by directory and `RGOUT001` exports.
 ///
-/// The default output includes DEX method annotations and runs sequentially.
+/// The default output includes DEX metadata annotations and runs sequentially.
 
 #[derive(Clone)]
 pub struct ExportOptions {
     pub thread_count: Option<usize>,
-    pub include_annotations: bool,
+    pub include_metadata: bool,
     pub progress_callback: Option<ProgressCallback>,
 }
 
@@ -44,7 +44,7 @@ impl Default for ExportOptions {
     fn default() -> Self {
         Self {
             thread_count: None,
-            include_annotations: true,
+            include_metadata: true,
             progress_callback: None,
         }
     }
@@ -71,9 +71,9 @@ impl ExportOptions {
         self
     }
 
-    /// Produces annotation-free output compatible with the historical DAD benchmark mode.
-    pub const fn dad_compatible(mut self) -> Self {
-        self.include_annotations = false;
+    /// Omits DEX annotations from rendered source.
+    pub const fn without_metadata(mut self) -> Self {
+        self.include_metadata = false;
         self
     }
 
@@ -212,17 +212,23 @@ pub fn decompile_class_file(
     path: impl AsRef<Path>,
     class_descriptor: &str,
 ) -> crate::Result<Option<SourceOutput>> {
-    let bytes = std::fs::read(path)?;
-    Decompiler::parse(&bytes)?.decompile_class_with_metadata(class_descriptor)
+    decompile_class_file_configured(path.as_ref(), class_descriptor, true)
 }
 
-/// Decompiles one class using annotation-free DAD-compatible rendering.
-pub fn decompile_class_file_dad(
-    path: impl AsRef<Path>,
+fn decompile_class_file_configured(
+    path: &Path,
     class_descriptor: &str,
-) -> crate::Result<Option<String>> {
+    include_metadata: bool,
+) -> crate::Result<Option<SourceOutput>> {
     let bytes = std::fs::read(path)?;
-    Decompiler::parse(&bytes)?.decompile_class_dad(class_descriptor)
+    let decompiler = Decompiler::parse(&bytes)?;
+    if include_metadata {
+        decompiler.decompile_class(class_descriptor)
+    } else {
+        decompiler
+            .without_metadata()
+            .decompile_class(class_descriptor)
+    }
 }
 
 fn print_inspect(path: &Path) -> crate::Result<()> {
@@ -245,17 +251,34 @@ fn print_inspect(path: &Path) -> crate::Result<()> {
 
 fn usage(program: &str) {
     eprintln!("usage: {program} inspect <file.dex>");
-    eprintln!("       {program} decompile <file.dex> <class-descriptor>");
-    eprintln!("       {program} decompile-dad <file.dex> <class-descriptor>");
-    eprintln!("       {program} export-all <file.dex|file.apk> [output-directory]");
+    eprintln!("       {program} decompile [--no-metadata] <file.dex> <class-descriptor>");
     eprintln!(
-        "       {program} export-all-parallel <file.dex|file.apk> [thread-count] [output-directory]"
+        "       {program} export-all [--no-metadata] <file.dex|file.apk> [output-directory]"
     );
-    eprintln!("       {program} export-all-dad <file.dex|file.apk> [output-directory]");
     eprintln!(
-        "       {program} export-all-dad-parallel <file.dex|file.apk> [thread-count] [output-directory]"
+        "       {program} export-all-parallel [--no-metadata] <file.dex|file.apk> [thread-count] [output-directory]"
     );
     eprintln!("       (thread-count defaults to half the available logical CPU count)");
+}
+
+fn take_metadata_option(args: &mut Vec<OsString>) -> Option<bool> {
+    let mut found = None;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == OsStr::new("--no-metadata") {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(index);
+        }
+        index += 1;
+    }
+    if let Some(index) = found {
+        args.remove(index);
+        Some(false)
+    } else {
+        Some(true)
+    }
 }
 
 fn default_thread_count_for(available: usize) -> usize {
@@ -315,14 +338,17 @@ fn export_dex_to_directory(
     dex_bytes: &[u8],
     output_directory: &Path,
     thread_count: Option<usize>,
-    include_annotations: bool,
+    include_metadata: bool,
 ) -> crate::Result<usize> {
     let decompiler = Decompiler::parse(dex_bytes)?;
-    let classes = match (thread_count, include_annotations) {
-        (Some(thread_count), true) => decompiler.decompile_all_parallel(thread_count)?,
-        (Some(thread_count), false) => decompiler.decompile_all_dad_parallel(thread_count)?,
-        (None, true) => decompiler.decompile_all()?,
-        (None, false) => decompiler.decompile_all_dad()?,
+    let decompiler = if include_metadata {
+        decompiler
+    } else {
+        decompiler.without_metadata()
+    };
+    let classes = match thread_count {
+        Some(thread_count) => decompiler.decompile_all_parallel(thread_count)?,
+        None => decompiler.decompile_all()?,
     };
     let count = classes.len();
     for (descriptor, source) in classes {
@@ -965,7 +991,7 @@ fn read_apk_dex(
 fn process_apk_parallel<F>(
     input: &Path,
     thread_count: usize,
-    include_annotations: bool,
+    include_metadata: bool,
     progress_callback: Option<&(dyn Fn(ExportProgress) + Send + Sync)>,
     emit_chunk: F,
 ) -> crate::Result<(usize, usize)>
@@ -1034,7 +1060,13 @@ where
                             let result =
                                 read_apk_dex(&apk, entry, &mut decompressor).and_then(|bytes| {
                                     let decompiler =
-                                        Arc::new(Decompiler::parse_owned(Arc::from(bytes))?);
+                                        Decompiler::parse_owned(Arc::from(bytes))?;
+                                    let decompiler = if include_metadata {
+                                        decompiler
+                                    } else {
+                                        decompiler.without_metadata()
+                                    };
+                                    let decompiler = Arc::new(decompiler);
                                     let classes = decompiler.dex().classes().len();
                                     let chunks = classes.div_ceil(APK_CLASS_CHUNK_SIZE);
                                     if chunks == 0 {
@@ -1129,7 +1161,6 @@ where
                             let mut records = Vec::with_capacity(range.len());
                             let result = dex.decompiler.decompile_class_range_for_export(
                                 range,
-                                include_annotations,
                                 |descriptor, output| {
                                     records.push((descriptor.to_owned(), output.source));
                                     Ok(())
@@ -1199,13 +1230,13 @@ fn export_apk_parallel_to_directory(
     input: &Path,
     output_directory: &Path,
     thread_count: usize,
-    include_annotations: bool,
+    include_metadata: bool,
     progress_callback: Option<&(dyn Fn(ExportProgress) + Send + Sync)>,
 ) -> crate::Result<(usize, usize)> {
     process_apk_parallel(
         input,
         thread_count,
-        include_annotations,
+        include_metadata,
         progress_callback,
         |_, _, records| {
             for (descriptor, source) in records {
@@ -1246,15 +1277,19 @@ struct BinaryDexOutput {
 fn decompile_dex_binary(
     dex_bytes: &[u8],
     thread_count: usize,
-    include_annotations: bool,
+    include_metadata: bool,
 ) -> crate::Result<BinaryDexOutput> {
     let decompiler = Decompiler::parse(dex_bytes)?;
+    let decompiler = if include_metadata {
+        decompiler
+    } else {
+        decompiler.without_metadata()
+    };
     let mut payload = Vec::new();
-    let classes = match (thread_count > 1, include_annotations) {
-        (true, true) => decompiler.decompile_all_parallel(thread_count)?,
-        (true, false) => decompiler.decompile_all_dad_parallel(thread_count)?,
-        (false, true) => decompiler.decompile_all()?,
-        (false, false) => decompiler.decompile_all_dad()?,
+    let classes = if thread_count > 1 {
+        decompiler.decompile_all_parallel(thread_count)?
+    } else {
+        decompiler.decompile_all()?
     };
     let class_count = classes.len() as u32;
     write_source_outputs(&mut payload, classes)?;
@@ -1321,7 +1356,7 @@ pub fn export_to_directory(
             input,
             output_directory,
             thread_count.unwrap_or(1),
-            options.include_annotations,
+            options.include_metadata,
             options.progress_callback.as_deref(),
         )?
     } else {
@@ -1332,7 +1367,7 @@ pub fn export_to_directory(
                 &bytes,
                 output_directory,
                 thread_count,
-                options.include_annotations,
+                options.include_metadata,
             )?,
         )
     };
@@ -1369,7 +1404,7 @@ pub fn export_to_writer(
         let (dex_files, classes) = process_apk_parallel(
             input,
             thread_count.unwrap_or(1),
-            options.include_annotations,
+            options.include_metadata,
             options.progress_callback.as_deref(),
             |dex_number, start_class, chunk| {
                 records
@@ -1388,7 +1423,7 @@ pub fn export_to_writer(
         let dex = decompile_dex_binary(
             &bytes,
             thread_count.unwrap_or(1),
-            options.include_annotations,
+            options.include_metadata,
         )?;
         (1, dex.class_count as usize, None, Some(dex.payload))
     };
@@ -1419,6 +1454,22 @@ pub fn run() -> crate::Result<()> {
         .and_then(|value| value.into_string().ok())
         .unwrap_or_else(|| "radguard".to_owned());
     let command = args.next();
+    let mut command_args: Vec<_> = args.collect();
+    let supports_metadata_option = command.as_deref().is_some_and(|command| {
+        matches!(
+            command.to_str(),
+            Some("decompile" | "export-all" | "export-all-parallel")
+        )
+    });
+    let include_metadata = if supports_metadata_option {
+        take_metadata_option(&mut command_args).unwrap_or_else(|| {
+            usage(&program);
+            std::process::exit(2);
+        })
+    } else {
+        true
+    };
+    let mut args = command_args.into_iter();
     let path = args.next();
     match command.as_deref() {
         Some(command) if command == std::ffi::OsStr::new("inspect") => {
@@ -1445,7 +1496,8 @@ pub fn run() -> crate::Result<()> {
                 usage(&program);
                 std::process::exit(2);
             }
-            let source = decompile_class_file(Path::new(&path), &class)?
+            let source =
+                decompile_class_file_configured(Path::new(&path), &class, include_metadata)?
                 .map(|output| output.source)
                 .unwrap_or_else(|| {
                     format!("Error: Class {class} not found in the reconstructed DEX.")
@@ -1453,30 +1505,7 @@ pub fn run() -> crate::Result<()> {
             print!("{source}");
             Ok(())
         }
-        Some(command) if command == std::ffi::OsStr::new("decompile-dad") => {
-            let Some(path) = path else {
-                usage(&program);
-                std::process::exit(2);
-            };
-            let Some(class) = args.next().and_then(|value| value.into_string().ok()) else {
-                usage(&program);
-                std::process::exit(2);
-            };
-            if args.next().is_some() {
-                usage(&program);
-                std::process::exit(2);
-            }
-            let source = decompile_class_file_dad(Path::new(&path), &class)?.unwrap_or_else(|| {
-                format!("Error: Class {class} not found in the reconstructed DEX.")
-            });
-            print!("{source}");
-            Ok(())
-        }
-        Some(command)
-            if command == std::ffi::OsStr::new("export-all")
-                || command == std::ffi::OsStr::new("export-all-dad") =>
-        {
-            let dad_compatible = command == std::ffi::OsStr::new("export-all-dad");
+        Some(command) if command == std::ffi::OsStr::new("export-all") => {
             let Some(path) = path else {
                 usage(&program);
                 std::process::exit(2);
@@ -1486,10 +1515,10 @@ pub fn run() -> crate::Result<()> {
                 usage(&program);
                 std::process::exit(2);
             }
-            let options = if dad_compatible {
-                ExportOptions::default().dad_compatible()
-            } else {
+            let options = if include_metadata {
                 ExportOptions::default()
+            } else {
+                ExportOptions::default().without_metadata()
             }
             .with_progress(cli_progress);
             if let Some(output_directory) = output_directory {
@@ -1506,11 +1535,7 @@ pub fn run() -> crate::Result<()> {
             }
             export_binary(Path::new(&path), options)
         }
-        Some(command)
-            if command == std::ffi::OsStr::new("export-all-parallel")
-                || command == std::ffi::OsStr::new("export-all-dad-parallel") =>
-        {
-            let dad_compatible = command == std::ffi::OsStr::new("export-all-dad-parallel");
+        Some(command) if command == std::ffi::OsStr::new("export-all-parallel") => {
             let Some(path) = path else {
                 usage(&program);
                 std::process::exit(2);
@@ -1536,10 +1561,10 @@ pub fn run() -> crate::Result<()> {
                 }
                 (None, Some(_)) => unreachable!("second argument requires the first argument"),
             };
-            let options = if dad_compatible {
-                ExportOptions::default().dad_compatible()
-            } else {
+            let options = if include_metadata {
                 ExportOptions::default()
+            } else {
+                ExportOptions::default().without_metadata()
             }
             .with_threads(thread_count)
             .with_progress(cli_progress);
@@ -1568,8 +1593,9 @@ pub fn run() -> crate::Result<()> {
 mod tests {
     use super::{
         default_thread_count_for, dex_entry_number, java_relative_path, parse_thread_count,
+        take_metadata_option,
     };
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::path::Path;
 
     #[test]
@@ -1599,6 +1625,31 @@ mod tests {
         assert_eq!(parse_thread_count(OsStr::new("8")), Some(8));
         assert_eq!(parse_thread_count(OsStr::new("0")), None);
         assert_eq!(parse_thread_count(OsStr::new("output")), None);
+    }
+
+    #[test]
+    fn metadata_option_is_position_independent_and_rejects_duplicates() {
+        let mut default_args = vec![OsString::from("classes.dex")];
+        assert_eq!(take_metadata_option(&mut default_args), Some(true));
+        assert_eq!(default_args, [OsString::from("classes.dex")]);
+
+        let mut flagged_args = vec![
+            OsString::from("classes.dex"),
+            OsString::from("--no-metadata"),
+            OsString::from("output"),
+        ];
+        assert_eq!(take_metadata_option(&mut flagged_args), Some(false));
+        assert_eq!(
+            flagged_args,
+            [OsString::from("classes.dex"), OsString::from("output")]
+        );
+
+        let mut duplicate_args = vec![
+            OsString::from("--no-metadata"),
+            OsString::from("classes.dex"),
+            OsString::from("--no-metadata"),
+        ];
+        assert_eq!(take_metadata_option(&mut duplicate_args), None);
     }
 
     #[test]

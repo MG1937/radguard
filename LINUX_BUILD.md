@@ -37,7 +37,10 @@ target/release/radguard
 ./target/release/radguard inspect classes.dex
 
 # Decompile one class
-./target/release/radguard decompile-dad classes.dex 'Lcom/example/MainActivity;'
+./target/release/radguard decompile classes.dex 'Lcom/example/MainActivity;'
+
+# Decompile one class without metadata annotations
+./target/release/radguard decompile --no-metadata classes.dex 'Lcom/example/MainActivity;'
 
 # Export an APK to package directories and individual .java files
 ./target/release/radguard export-all app.apk output

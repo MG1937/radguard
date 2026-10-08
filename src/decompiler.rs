@@ -7,58 +7,43 @@ use crate::error::{Error, Result};
 use crate::graph::Graph;
 use crate::ir::opcode::lower_method_with_resolved;
 use crate::types::{class_access, descriptor_to_java, field_access, method_access};
-use crate::writer::{
-    escape_java_string, MemberKind, MemberReference, MethodWriter, SourceOutput,
-};
+use crate::writer::{escape_java_string, MemberKind, MemberReference, MethodWriter, SourceOutput};
 
 pub struct Decompiler<'a> {
     dex: DexFile<'a>,
-}
-
-pub struct DadSourceArchive {
-    pub descriptors: String,
-    pub source: String,
-    pub classes: Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>,
+    include_metadata: bool,
 }
 
 impl<'a> Decompiler<'a> {
     pub fn parse(dex_bytes: &'a [u8]) -> Result<Self> {
         Ok(Self {
             dex: DexFile::parse(dex_bytes)?,
+            include_metadata: true,
         })
     }
 
     pub(crate) fn parse_owned(dex_bytes: std::sync::Arc<[u8]>) -> Result<Decompiler<'static>> {
         Ok(Decompiler {
             dex: DexFile::parse_owned(dex_bytes)?,
+            include_metadata: true,
         })
+    }
+
+    /// Disables DEX annotations in rendered source while retaining member-reference metadata.
+    pub const fn without_metadata(mut self) -> Self {
+        self.include_metadata = false;
+        self
     }
 
     pub fn dex(&self) -> &DexFile<'a> {
         &self.dex
     }
 
-    pub fn decompile_class(&self, dalvik_class: &str) -> Result<Option<String>> {
-        Ok(self
-            .decompile_class_with_metadata(dalvik_class)?
-            .map(|output| output.source))
-    }
-
-    pub fn decompile_class_with_metadata(
-        &self,
-        dalvik_class: &str,
-    ) -> Result<Option<SourceOutput>> {
+    pub fn decompile_class(&self, dalvik_class: &str) -> Result<Option<SourceOutput>> {
         let Some(class) = self.dex.class(dalvik_class) else {
             return Ok(None);
         };
-        self.write_class::<true, true>(class).map(Some)
-    }
-
-    pub fn decompile_class_dad(&self, dalvik_class: &str) -> Result<Option<String>> {
-        let Some(class) = self.dex.class(dalvik_class) else {
-            return Ok(None);
-        };
-        Ok(Some(self.write_class::<false, false>(class)?.source))
+        self.write_class(class).map(Some)
     }
 
     pub fn decompile_all(&self) -> Result<Vec<(String, SourceOutput)>> {
@@ -68,47 +53,10 @@ impl<'a> Decompiler<'a> {
             .map(|class| {
                 Ok((
                     self.dex.class_descriptor(class)?.to_owned(),
-                    self.write_class::<true, true>(class)?,
+                    self.write_class(class)?,
                 ))
             })
             .collect()
-    }
-
-    pub fn decompile_all_dad(&self) -> Result<Vec<(String, SourceOutput)>> {
-        self.dex
-            .classes()
-            .iter()
-            .map(|class| {
-                Ok((
-                    self.dex.class_descriptor(class)?.to_owned(),
-                    self.write_class::<true, false>(class)?,
-                ))
-            })
-            .collect()
-    }
-
-    pub fn decompile_all_dad_source(&self) -> Result<DadSourceArchive> {
-        let mut output = SourceOutput {
-            source: String::with_capacity(self.dex.byte_len().saturating_mul(2)),
-            member_references: Vec::new(),
-        };
-        let mut descriptors = String::new();
-        let mut classes = Vec::with_capacity(self.dex.classes().len());
-        for class in self.dex.classes() {
-            let descriptor_start = descriptors.len();
-            descriptors.push_str(self.dex.class_descriptor(class)?);
-            let source_start = output.source.len();
-            output = self.write_class_into::<false, false>(output, class)?;
-            classes.push((
-                descriptor_start..descriptors.len(),
-                source_start..output.source.len(),
-            ));
-        }
-        Ok(DadSourceArchive {
-            descriptors,
-            source: output.source,
-            classes,
-        })
     }
 
     /// Decompile one scheduler-owned class range. APK pipeline workers use this
@@ -117,7 +65,6 @@ impl<'a> Decompiler<'a> {
     pub(crate) fn decompile_class_range_for_export<F>(
         &self,
         range: std::ops::Range<usize>,
-        include_annotations: bool,
         mut visit: F,
     ) -> Result<usize>
     where
@@ -130,11 +77,7 @@ impl<'a> Decompiler<'a> {
             .ok_or_else(|| Error::data(0, "APK class job has an invalid class range"))?;
         for class in classes {
             let descriptor = self.dex.class_descriptor(class)?;
-            let output = if include_annotations {
-                self.write_class::<false, true>(class)?
-            } else {
-                self.write_class::<false, false>(class)?
-            };
+            let output = self.write_class(class)?;
             visit(descriptor, output)?;
         }
         Ok(range.len())
@@ -144,28 +87,9 @@ impl<'a> Decompiler<'a> {
         &self,
         thread_count: usize,
     ) -> Result<Vec<(String, SourceOutput)>> {
-        self.decompile_all_parallel_impl(thread_count, true)
-    }
-
-    pub fn decompile_all_dad_parallel(
-        &self,
-        thread_count: usize,
-    ) -> Result<Vec<(String, SourceOutput)>> {
-        self.decompile_all_parallel_impl(thread_count, false)
-    }
-
-    fn decompile_all_parallel_impl(
-        &self,
-        thread_count: usize,
-        include_annotations: bool,
-    ) -> Result<Vec<(String, SourceOutput)>> {
         let classes = self.dex.classes();
         if thread_count <= 1 || classes.len() <= 1 {
-            return if include_annotations {
-                self.decompile_all()
-            } else {
-                self.decompile_all_dad()
-            };
+            return self.decompile_all();
         }
 
         let worker_count = thread_count.min(classes.len());
@@ -179,11 +103,7 @@ impl<'a> Decompiler<'a> {
                         .map(|class| {
                             Ok((
                                 self.dex.class_descriptor(class)?.to_owned(),
-                                if include_annotations {
-                                    self.write_class::<true, true>(class)?
-                                } else {
-                                    self.write_class::<true, false>(class)?
-                                },
+                                self.write_class(class)?,
                             ))
                         })
                         .collect::<Result<Vec<_>>>()
@@ -201,17 +121,11 @@ impl<'a> Decompiler<'a> {
         })
     }
 
-    fn write_class<const RECORD_REFERENCES: bool, const INCLUDE_ANNOTATIONS: bool>(
-        &self,
-        class: &ClassDef,
-    ) -> Result<SourceOutput> {
-        self.write_class_into::<RECORD_REFERENCES, INCLUDE_ANNOTATIONS>(
-            SourceOutput::default(),
-            class,
-        )
+    fn write_class(&self, class: &ClassDef) -> Result<SourceOutput> {
+        self.write_class_into(SourceOutput::default(), class)
     }
 
-    fn write_class_into<const RECORD_REFERENCES: bool, const INCLUDE_ANNOTATIONS: bool>(
+    fn write_class_into(
         &self,
         mut output: SourceOutput,
         class: &ClassDef,
@@ -262,42 +176,26 @@ impl<'a> Decompiler<'a> {
         output.source.push_str(" {\n");
 
         for field in class.fields() {
-            self.write_field::<RECORD_REFERENCES>(&mut output, field)?;
+            self.write_field(&mut output, field)?;
         }
-        if INCLUDE_ANNOTATIONS {
-            let method_annotations = self.dex.method_annotations(class)?;
-            for method in class.methods() {
-                output = self.write_method::<RECORD_REFERENCES>(
-                    output,
-                    descriptor,
-                    &name,
-                    method,
-                    method_annotations
-                        .get(&method.method_idx)
-                        .map(Vec::as_slice)
-                        .unwrap_or_default(),
-                )?;
-            }
+        let method_annotations = if self.include_metadata {
+            Some(self.dex.method_annotations(class)?)
         } else {
-            for method in class.methods() {
-                output = self.write_method::<RECORD_REFERENCES>(
-                    output,
-                    descriptor,
-                    &name,
-                    method,
-                    &[],
-                )?;
-            }
+            None
+        };
+        for method in class.methods() {
+            let annotations = method_annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(&method.method_idx))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            output = self.write_method(output, descriptor, &name, method, annotations)?;
         }
         output.source.push_str("}\n");
         Ok(output)
     }
 
-    fn write_field<const RECORD_REFERENCES: bool>(
-        &self,
-        output: &mut SourceOutput,
-        field: &EncodedField,
-    ) -> Result<()> {
+    fn write_field(&self, output: &mut SourceOutput, field: &EncodedField) -> Result<()> {
         let resolved = self.dex.field(field.field_idx)?;
         output.source.push_str("    ");
         let access = field_access(field.access_flags);
@@ -309,17 +207,15 @@ impl<'a> Decompiler<'a> {
         output.source.push(' ');
         let start = output.source.len();
         output.source.push_str(resolved.name);
-        if RECORD_REFERENCES {
-            output.member_references.push(MemberReference {
-                start,
-                end: output.source.len(),
-                kind: MemberKind::Field,
-                class: resolved.class.to_owned(),
-                name: resolved.name.to_owned(),
-                descriptor: resolved.ty.to_owned(),
-                declaration: true,
-            });
-        }
+        output.member_references.push(MemberReference {
+            start,
+            end: output.source.len(),
+            kind: MemberKind::Field,
+            class: resolved.class.to_owned(),
+            name: resolved.name.to_owned(),
+            descriptor: resolved.ty.to_owned(),
+            declaration: true,
+        });
         if let Some(value) = &field.initial_value {
             output.source.push_str(" = ");
             output.source.push_str(&self.encoded_value(value, resolved.ty)?);
@@ -328,7 +224,7 @@ impl<'a> Decompiler<'a> {
         Ok(())
     }
 
-    fn write_method<const RECORD_REFERENCES: bool>(
+    fn write_method(
         &self,
         mut output: SourceOutput,
         class_descriptor: &str,
@@ -365,17 +261,15 @@ impl<'a> Decompiler<'a> {
         };
         let name_start = output.source.len();
         output.source.push_str(displayed_name);
-        if RECORD_REFERENCES {
-            output.member_references.push(MemberReference {
-                start: name_start,
-                end: output.source.len(),
-                kind: MemberKind::Method,
-                class: class_descriptor.to_owned(),
-                name: resolved.name.to_owned(),
-                descriptor: resolved.descriptor.to_owned(),
-                declaration: true,
-            });
-        }
+        output.member_references.push(MemberReference {
+            start: name_start,
+            end: output.source.len(),
+            kind: MemberKind::Method,
+            class: class_descriptor.to_owned(),
+            name: resolved.name.to_owned(),
+            descriptor: resolved.descriptor.to_owned(),
+            declaration: true,
+        });
 
         let lowered = lower_method_with_resolved(&self.dex, method, resolved)?;
         let mut graph = lowered.map(Graph::from_lowered);
@@ -426,7 +320,7 @@ impl<'a> Decompiler<'a> {
         graph.compute_rpo();
         control_flow::identify_structures(graph);
         Ok(
-            MethodWriter::<RECORD_REFERENCES>::new_moving_conditions(
+            MethodWriter::new_moving_conditions(
                 graph,
                 class_descriptor,
                 constructor,
@@ -545,24 +439,19 @@ impl<'a> Decompiler<'a> {
     }
 }
 
-pub fn decompile_dex_bytes(dex_bytes: &[u8], dalvik_class_fmt: &str) -> Result<String> {
-    let decompiler = Decompiler::parse(dex_bytes)?;
-    Ok(decompiler
-        .decompile_class(dalvik_class_fmt)?
-        .unwrap_or_else(|| format!("Error: Class {dalvik_class_fmt} not found in the reconstructed DEX.")))
-}
-
-pub fn decompile_dex_bytes_with_metadata(
+pub fn decompile_dex_bytes(
     dex_bytes: &[u8],
     dalvik_class_fmt: &str,
-) -> Result<(String, Vec<MemberReference>)> {
+) -> Result<SourceOutput> {
     let decompiler = Decompiler::parse(dex_bytes)?;
-    Ok(match decompiler.decompile_class_with_metadata(dalvik_class_fmt)? {
-        Some(output) => (output.source, output.member_references),
-        None => (
-            format!("Error: Class {dalvik_class_fmt} not found in the reconstructed DEX."),
-            Vec::new(),
-        ),
+    Ok(match decompiler.decompile_class(dalvik_class_fmt)? {
+        Some(output) => output,
+        None => SourceOutput {
+            source: format!(
+                "Error: Class {dalvik_class_fmt} not found in the reconstructed DEX."
+            ),
+            member_references: Vec::new(),
+        },
     })
 }
 
