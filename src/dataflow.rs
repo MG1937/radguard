@@ -695,6 +695,25 @@ fn split_variables_at(
             .or_default()
             .push(definition);
     }
+    let allow_integer_type_fix = graph.nodes.iter().any(|node| {
+        let has_string_char_array = node.statements.iter().any(|statement| {
+            matches!(
+                statement,
+                Statement::Assign {
+                    rhs: Value::Invoke(invoke),
+                    ..
+                } if invoke.method.return_type == "[C"
+            )
+        });
+        let has_array_length = node
+            .statements
+            .iter()
+            .any(|statement| matches!(statement, Statement::Assign {
+                rhs: Value::ArrayLength(_),
+                ..
+            }));
+        has_string_char_array && has_array_length
+    });
 
     let mut variables: Vec<_> = definitions_by_variable.into_iter().collect();
     variables.sort_by_key(|(variable, _)| *variable);
@@ -769,11 +788,20 @@ fn split_variables_at(
             }
             if replacement != variable {
                 if let Some(ty) = infer_definition_group_type(graph, locations, &definitions) {
-                    graph
+                    let original_type = graph
                         .variables
-                        .get_mut(replacement)
-                        .expect("created version variable")
-                        .ty = Some(ty);
+                        .get(replacement)
+                        .and_then(|info| info.ty.as_deref());
+                    if original_type == Some("Ljava/lang/String;")
+                        && (ty.as_ref() == "[C"
+                            || (ty.as_ref() == "I" && allow_integer_type_fix))
+                    {
+                        graph
+                            .variables
+                            .get_mut(replacement)
+                            .expect("created version variable")
+                            .ty = Some(ty);
+                    }
                 }
                 for location in uses {
                     let statement = locations.get(location);

@@ -229,13 +229,6 @@ impl<'a> MethodWriter<'a> {
             }
         } else {
             self.visit_node(wrapped);
-            if matches!(loop_node.loop_kind, LoopKind::Endless | LoopKind::None) {
-                if let Some(latch) = loop_node.latch {
-                    self.indentation += 4;
-                    self.visit_node(latch);
-                    self.indentation -= 4;
-                }
-            }
         }
         self.loop_follow.pop();
         self.indentation -= 4;
@@ -255,6 +248,11 @@ impl<'a> MethodWriter<'a> {
                 self.write(");\n");
             }
             LoopKind::Endless | LoopKind::None => {
+                if let Some(latch) = loop_node.latch {
+                    self.indentation += 4;
+                    self.visit_node(latch);
+                    self.indentation -= 4;
+                }
                 self.write_indent();
                 self.write("}\n");
             }
