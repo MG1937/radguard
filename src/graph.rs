@@ -181,6 +181,67 @@ impl Graph {
             .filter_map(|(id, node)| node.active.then_some(id))
     }
 
+    pub(crate) fn debug_dump(&self, label: &str) {
+        eprintln!(
+            "[radguard-debug] CFG {label}: entry={} active_nodes={} rpo={:?}",
+            self.entry,
+            self.active_nodes().count(),
+            self.rpo
+        );
+        for (id, node) in self.nodes.iter().enumerate() {
+            if !node.active && node.wrapped.is_none() {
+                continue;
+            }
+            eprintln!(
+                "[radguard-debug]   node={} active={} range={}..{} kind={:?} rpo={} pred={:?} succ={:?} branch=({:?},{:?}) wrapped={:?} statements={:?}",
+                id,
+                node.active,
+                node.start,
+                node.end,
+                node.kind,
+                node.rpo,
+                node.predecessors,
+                node.successors,
+                node.branch_true,
+                node.branch_false,
+                node.wrapped,
+                node.statements
+            );
+        }
+        for (variable, info) in self.variables.iter() {
+            eprintln!(
+                "[radguard-debug]   var={:?} name={:?} ty={:?} declared={} this={} super={}",
+                variable,
+                self.variables.name(variable),
+                info.ty,
+                self.variables.is_declared(variable),
+                self.variables.is_this(variable),
+                self.variables.is_super(variable)
+            );
+        }
+    }
+
+    pub(crate) fn debug_loop_metadata(&self, label: &str) {
+        eprintln!("[radguard-debug] loops {label}:");
+        for (id, node) in self.nodes.iter().enumerate() {
+            if node.loop_kind == LoopKind::None && node.kind != BlockKind::Loop {
+                continue;
+            }
+            eprintln!(
+                "[radguard-debug]   node={} active={} kind={:?} loop_kind={:?} latch={:?} follow={:?} nodes={:?} branches=({:?},{:?})",
+                id,
+                node.active,
+                node.kind,
+                node.loop_kind,
+                node.latch,
+                node.loop_follow,
+                node.loop_nodes,
+                node.branch_true,
+                node.branch_false
+            );
+        }
+    }
+
     pub fn successors(&self, node: NodeId) -> &[NodeId] {
         &self.nodes[node].successors
     }

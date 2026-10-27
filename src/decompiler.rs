@@ -12,6 +12,7 @@ use crate::writer::{escape_java_string, MemberKind, MemberReference, MethodWrite
 pub struct Decompiler<'a> {
     dex: DexFile<'a>,
     include_metadata: bool,
+    debug: bool,
 }
 
 impl<'a> Decompiler<'a> {
@@ -19,6 +20,7 @@ impl<'a> Decompiler<'a> {
         Ok(Self {
             dex: DexFile::parse(dex_bytes)?,
             include_metadata: true,
+            debug: false,
         })
     }
 
@@ -26,12 +28,18 @@ impl<'a> Decompiler<'a> {
         Ok(Decompiler {
             dex: DexFile::parse_owned(dex_bytes)?,
             include_metadata: true,
+            debug: false,
         })
     }
 
     /// Disables DEX annotations in rendered source while retaining member-reference metadata.
     pub const fn without_metadata(mut self) -> Self {
         self.include_metadata = false;
+        self
+    }
+
+    pub const fn with_debug(mut self, debug: bool) -> Self {
+        self.debug = debug;
         self
     }
 
@@ -233,6 +241,14 @@ impl<'a> Decompiler<'a> {
         annotations: &[EncodedAnnotation],
     ) -> Result<SourceOutput> {
         let resolved = self.dex.method(method.method_idx)?;
+        if self.debug {
+            eprintln!(
+                "[radguard-debug] method {}->{}{}",
+                class_descriptor,
+                resolved.name,
+                resolved.descriptor
+            );
+        }
         let return_type = resolved.return_type;
         let access = method_access(method.access_flags);
         let constructor = access.iter().any(|value| value == "constructor");
@@ -314,17 +330,27 @@ impl<'a> Decompiler<'a> {
             output.source.push_str(";\n");
             return Ok(output);
         };
+        if self.debug {
+            graph.debug_dump("lowered");
+        }
         dataflow::optimize_for_decompilation(graph);
         graph.split_condition_nodes();
         graph.simplify();
         graph.compute_rpo();
-        control_flow::identify_structures(graph);
+        if self.debug {
+            graph.debug_dump("after-dataflow-and-simplify");
+            control_flow::identify_structures_debug(graph);
+            graph.debug_dump("after-structure");
+        } else {
+            control_flow::identify_structures(graph);
+        }
         Ok(
             MethodWriter::new_moving_conditions(
                 graph,
                 class_descriptor,
                 constructor,
                 output,
+                self.debug,
             )
             .write_body(),
         )

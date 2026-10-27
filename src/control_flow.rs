@@ -4,29 +4,33 @@ use crate::graph::{ConditionTree, Graph, LoopKind, NodeId};
 use crate::ir::opcode::BlockKind;
 
 pub fn identify_structures(graph: &mut Graph) {
+    identify_structures_impl(graph, false);
+}
+
+pub(crate) fn identify_structures_debug(graph: &mut Graph) {
+    identify_structures_impl(graph, true);
+}
+
+fn identify_structures_impl(graph: &mut Graph, debug: bool) {
     graph.compute_rpo();
     let mut catch_dominators = graph.immediate_dominators();
     structure_switches(graph, &catch_dominators);
     mark_loops(graph);
+    if debug {
+        graph.debug_loop_metadata("after-mark-loops");
+    }
     merge_short_circuits(graph, &mut catch_dominators);
 
-    let unresolved_if = structure_ifs(graph, &catch_dominators);
+    structure_ifs(graph);
     finish_loop_metadata(graph);
+    if debug {
+        graph.debug_loop_metadata("after-finish-loop-metadata");
+    }
     wrap_loops(graph, &mut catch_dominators);
     graph.compute_rpo();
     refresh_loop_follows(graph);
-
-    for node in unresolved_if {
-        if node >= graph.nodes.len() || !graph.nodes[node].active {
-            continue;
-        }
-        graph.nodes[node].if_follow = [
-            graph.nodes[node].loop_follow,
-            graph.nodes[node].switch_follow,
-        ]
-        .into_iter()
-        .flatten()
-        .min_by_key(|follow| graph.nodes[*follow].rpo);
+    if debug {
+        graph.debug_loop_metadata("after-wrap-loops");
     }
 
     structure_catches(graph, &catch_dominators);
@@ -45,10 +49,84 @@ fn mark_loops(graph: &mut Graph) {
         derived = derived.collapse(partition);
     }
 
+    if marks
+        .iter()
+        .any(|mark| !loop_mark_has_backedge(graph, mark))
+    {
+        marks = natural_loop_marks(graph);
+    }
+
     for mark in marks {
         graph.nodes[mark.head].loop_kind = LoopKind::Endless;
         graph.nodes[mark.head].latch = Some(mark.latch);
         graph.nodes[mark.head].loop_nodes = mark.nodes;
+    }
+}
+
+fn loop_mark_has_backedge(graph: &Graph, mark: &LoopMark) -> bool {
+    graph.nodes[mark.latch]
+        .successors
+        .iter()
+        .any(|target| *target == mark.head || mark.nodes.contains(target))
+}
+
+fn natural_loop_marks(graph: &Graph) -> Vec<LoopMark> {
+    let dominators = graph.immediate_dominators();
+    let mut grouped = HashMap::<NodeId, (HashSet<NodeId>, NodeId)>::new();
+
+    for source in graph.active_nodes() {
+        for &head in &graph.nodes[source].successors {
+            if !dominates(graph, &dominators, head, source) {
+                continue;
+            }
+            let entry = grouped
+                .entry(head)
+                .or_insert_with(|| (HashSet::from([head]), source));
+            entry.0.insert(source);
+            let mut pending = vec![source];
+            while let Some(node) = pending.pop() {
+                if node == head {
+                    continue;
+                }
+                for &predecessor in &graph.nodes[node].predecessors {
+                    if entry.0.insert(predecessor) {
+                        pending.push(predecessor);
+                    }
+                }
+            }
+            entry.1 = source;
+        }
+    }
+
+    let mut marks: Vec<_> = grouped
+        .into_iter()
+        .map(|(head, (nodes, latch))| {
+            let mut nodes: Vec<_> = nodes.into_iter().collect();
+            nodes.sort_by_key(|node| graph.nodes[*node].rpo);
+            LoopMark { head, latch, nodes }
+        })
+        .collect();
+    marks.sort_by_key(|mark| graph.nodes[mark.head].rpo);
+    marks
+}
+
+fn dominates(
+    graph: &Graph,
+    dominators: &[Option<NodeId>],
+    target: NodeId,
+    mut node: NodeId,
+) -> bool {
+    loop {
+        if node == target {
+            return true;
+        }
+        let Some(parent) = dominators.get(node).copied().flatten() else {
+            return false;
+        };
+        node = parent;
+        if node == graph.entry && node != target {
+            return false;
+        }
     }
 }
 
@@ -380,6 +458,24 @@ fn collect_loop_nodes(
 }
 
 fn classify_loop(graph: &Graph, head: NodeId, latch: NodeId, nodes: &HashSet<NodeId>) -> LoopKind {
+    let latch_loops_back = [
+        graph.nodes[latch].branch_true,
+        graph.nodes[latch].branch_false,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|target| nodes.contains(&target));
+    if is_condition_kind(graph.nodes[latch].kind) && !latch_loops_back {
+        return if is_condition_kind(graph.nodes[head].kind) {
+            if branch_inside(graph, head, true, nodes) && branch_inside(graph, head, false, nodes) {
+                LoopKind::Endless
+            } else {
+                LoopKind::PreTest
+            }
+        } else {
+            LoopKind::Endless
+        };
+    }
     if is_condition_kind(graph.nodes[latch].kind) {
         if is_condition_kind(graph.nodes[head].kind) {
             if branch_inside(graph, head, true, nodes) && branch_inside(graph, head, false, nodes) {
@@ -450,42 +546,105 @@ fn opposite_branch(graph: &Graph, node: NodeId, nodes: &HashSet<NodeId>) -> Opti
     }
 }
 
-fn structure_ifs(graph: &mut Graph, dominators: &[Option<NodeId>]) -> HashSet<NodeId> {
-    let mut unresolved = HashSet::<NodeId>::new();
-    let post_order: Vec<_> = graph.rpo.iter().rev().copied().collect();
-    for node in post_order {
+fn structure_ifs(graph: &mut Graph) {
+    let post_dominators = immediate_post_dominators(graph);
+    for &node in graph.rpo.iter().rev() {
         if !matches!(
             graph.nodes[node].kind,
             BlockKind::Condition | BlockKind::ShortCircuit
         ) {
             continue;
         }
-        let follow = graph
-            .active_nodes()
-            .filter(|candidate| {
-                dominators[*candidate] == Some(node)
-                    && graph.nodes[*candidate].predecessors.len() > 1
-            })
-            .max_by_key(|candidate| graph.nodes[*candidate].rpo);
-        if let Some(follow) = follow {
-            graph.nodes[node].if_follow = Some(follow);
-            let resolved: Vec<_> = unresolved
-                .iter()
-                .copied()
-                .filter(|candidate| {
-                    graph.nodes[node].rpo < graph.nodes[*candidate].rpo
-                        && graph.nodes[*candidate].rpo < graph.nodes[follow].rpo
-                })
-                .collect();
-            for candidate in resolved {
-                graph.nodes[candidate].if_follow = Some(follow);
-                unresolved.remove(&candidate);
+        // A backedge target is not a valid structured-if follow.
+        graph.nodes[node].if_follow = post_dominators[node]
+            .filter(|follow| !mutually_reachable(graph, node, *follow));
+    }
+}
+
+fn mutually_reachable(graph: &Graph, first: NodeId, second: NodeId) -> bool {
+    reaches(graph, first, second) && reaches(graph, second, first)
+}
+
+fn reaches(graph: &Graph, start: NodeId, target: NodeId) -> bool {
+    let mut seen = HashSet::from([start]);
+    let mut pending = vec![start];
+    while let Some(node) = pending.pop() {
+        for successor in graph.all_successors(node) {
+            if successor == target {
+                return true;
             }
-        } else {
-            unresolved.insert(node);
+            if seen.insert(successor) {
+                pending.push(successor);
+            }
         }
     }
-    unresolved
+    false
+}
+
+fn immediate_post_dominators(graph: &Graph) -> Vec<Option<NodeId>> {
+    let mut post_dominators = vec![HashSet::new(); graph.nodes.len()];
+    let active: HashSet<_> = graph.rpo.iter().copied().collect();
+    let universe = active.clone();
+
+    for &node in &graph.rpo {
+        if !active.contains(&node) {
+            continue;
+        }
+        if graph
+            .all_successors(node)
+            .filter(|successor| active.contains(successor))
+            .next()
+            .is_none()
+        {
+            post_dominators[node].insert(node);
+        } else {
+            post_dominators[node] = universe.clone();
+        }
+    }
+
+    loop {
+        let mut changed = false;
+        for &node in graph.rpo.iter().rev() {
+            if !active.contains(&node) {
+                continue;
+            }
+            let successors: Vec<_> = graph
+                .all_successors(node)
+                .filter(|successor| active.contains(successor))
+                .collect();
+            if successors.is_empty() {
+                continue;
+            }
+            let mut intersection = post_dominators[successors[0]].clone();
+            for successor in successors.iter().skip(1) {
+                intersection.retain(|candidate| post_dominators[*successor].contains(candidate));
+            }
+            intersection.insert(node);
+            if post_dominators[node] != intersection {
+                post_dominators[node] = intersection;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut immediate = vec![None; graph.nodes.len()];
+    for &node in &graph.rpo {
+        let candidates: Vec<_> = post_dominators[node]
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != node)
+            .collect();
+        immediate[node] = candidates.into_iter().max_by_key(|candidate| {
+            (
+                post_dominators[*candidate].len(),
+                usize::MAX - graph.nodes[*candidate].rpo,
+            )
+        });
+    }
+    immediate
 }
 
 fn structure_switches(graph: &mut Graph, dominators: &[Option<NodeId>]) {
@@ -752,6 +911,30 @@ fn wrap_loops(graph: &mut Graph, dominators: &mut [Option<NodeId>]) {
         }
         graph.replace_structural_references(head, wrapper);
         graph.remove_node(head);
+        // Nested loop wrappers are created after their outer wrapper. The
+        // outer wrapper keeps an inactive raw body for traversal, so its
+        // successor to this loop head must follow the new wrapper as well.
+        for source in 0..graph.nodes.len() {
+            if graph.nodes[source].active || source == head {
+                continue;
+            }
+            for successor in &mut graph.nodes[source].successors {
+                if *successor == head {
+                    *successor = wrapper;
+                }
+            }
+            for successor in &mut graph.nodes[source].catch_successors {
+                if *successor == head {
+                    *successor = wrapper;
+                }
+            }
+            if graph.nodes[source].branch_true == Some(head) {
+                graph.nodes[source].branch_true = Some(wrapper);
+            }
+            if graph.nodes[source].branch_false == Some(head) {
+                graph.nodes[source].branch_false = Some(wrapper);
+            }
+        }
         // The structured writer still visits the inactive wrapped node as the
         // loop body. Preserve its outgoing traversal edges after disconnecting
         // it from the active CFG.

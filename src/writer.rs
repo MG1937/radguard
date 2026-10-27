@@ -43,6 +43,7 @@ impl SourceOutput {
 
 pub struct MethodWriter<'a> {
     graph: &'a Graph,
+    debug: bool,
     output: SourceOutput,
     declared: Vec<bool>,
     visited: Vec<bool>,
@@ -74,6 +75,7 @@ impl<'a> MethodWriter<'a> {
             constructor,
             conditions,
             SourceOutput::default(),
+            false,
         )
     }
 
@@ -82,13 +84,14 @@ impl<'a> MethodWriter<'a> {
         current_class: &'a str,
         constructor: bool,
         output: SourceOutput,
+        debug: bool,
     ) -> Self {
         let conditions = graph
             .nodes
             .iter_mut()
             .map(|node| node.condition.take())
             .collect();
-        Self::with_conditions(graph, current_class, constructor, conditions, output)
+        Self::with_conditions(graph, current_class, constructor, conditions, output, debug)
     }
 
     fn with_conditions(
@@ -97,9 +100,11 @@ impl<'a> MethodWriter<'a> {
         constructor: bool,
         conditions: Vec<Option<ConditionTree>>,
         output: SourceOutput,
+        debug: bool,
     ) -> Self {
         Self {
             graph,
+            debug,
             output,
             declared: {
                 let mut declared = vec![false; graph.variables.dense_len()];
@@ -176,6 +181,18 @@ impl<'a> MethodWriter<'a> {
 
     fn visit_loop_node(&mut self, node: NodeId) {
         let loop_node = &self.graph.nodes[node];
+        if self.debug {
+            eprintln!(
+                "[radguard-debug] writer loop node={} kind={:?} wrapped={:?} latch={:?} follow={:?} branches=({:?},{:?})",
+                node,
+                loop_node.loop_kind,
+                loop_node.wrapped,
+                loop_node.latch,
+                loop_node.loop_follow,
+                loop_node.branch_true,
+                loop_node.branch_false
+            );
+        }
         let follow = loop_node.loop_follow;
         let wrapped = loop_node.wrapped.expect("loop wrapper has a condition");
         let mut true_branch = loop_node.branch_true;
@@ -212,6 +229,13 @@ impl<'a> MethodWriter<'a> {
             }
         } else {
             self.visit_node(wrapped);
+            if matches!(loop_node.loop_kind, LoopKind::Endless | LoopKind::None) {
+                if let Some(latch) = loop_node.latch {
+                    self.indentation += 4;
+                    self.visit_node(latch);
+                    self.indentation -= 4;
+                }
+            }
         }
         self.loop_follow.pop();
         self.indentation -= 4;
@@ -231,11 +255,6 @@ impl<'a> MethodWriter<'a> {
                 self.write(");\n");
             }
             LoopKind::Endless | LoopKind::None => {
-                if let Some(latch) = loop_node.latch {
-                    self.indentation += 4;
-                    self.visit_node(latch);
-                    self.indentation -= 4;
-                }
                 self.write_indent();
                 self.write("}\n");
             }
@@ -247,6 +266,16 @@ impl<'a> MethodWriter<'a> {
 
     fn visit_condition_node(&mut self, node: NodeId) {
         let condition = &self.graph.nodes[node];
+        if self.debug {
+            eprintln!(
+                "[radguard-debug] writer condition node={} follow={:?} branches=({:?},{:?}) statements={:?}",
+                node,
+                condition.if_follow,
+                condition.branch_true,
+                condition.branch_false,
+                condition.statements
+            );
+        }
         let follow = condition.if_follow;
         let mut true_branch = condition.branch_true;
         let mut false_branch = condition.branch_false;

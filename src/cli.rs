@@ -37,6 +37,7 @@ pub type ProgressCallback = Arc<dyn Fn(ExportProgress) + Send + Sync + 'static>;
 pub struct ExportOptions {
     pub thread_count: Option<usize>,
     pub include_metadata: bool,
+    pub debug: bool,
     pub progress_callback: Option<ProgressCallback>,
 }
 
@@ -45,6 +46,7 @@ impl Default for ExportOptions {
         Self {
             thread_count: None,
             include_metadata: true,
+            debug: false,
             progress_callback: None,
         }
     }
@@ -74,6 +76,12 @@ impl ExportOptions {
     /// Omits DEX annotations from rendered source.
     pub const fn without_metadata(mut self) -> Self {
         self.include_metadata = false;
+        self
+    }
+
+    /// Emits CFG and structure-recovery diagnostics to stderr.
+    pub const fn with_debug(mut self, debug: bool) -> Self {
+        self.debug = debug;
         self
     }
 
@@ -212,16 +220,17 @@ pub fn decompile_class_file(
     path: impl AsRef<Path>,
     class_descriptor: &str,
 ) -> crate::Result<Option<SourceOutput>> {
-    decompile_class_file_configured(path.as_ref(), class_descriptor, true)
+    decompile_class_file_configured(path.as_ref(), class_descriptor, true, false)
 }
 
 fn decompile_class_file_configured(
     path: &Path,
     class_descriptor: &str,
     include_metadata: bool,
+    debug: bool,
 ) -> crate::Result<Option<SourceOutput>> {
     let bytes = std::fs::read(path)?;
-    let decompiler = Decompiler::parse(&bytes)?;
+    let decompiler = Decompiler::parse(&bytes)?.with_debug(debug);
     if include_metadata {
         decompiler.decompile_class(class_descriptor)
     } else {
@@ -251,12 +260,14 @@ fn print_inspect(path: &Path) -> crate::Result<()> {
 
 fn usage(program: &str) {
     eprintln!("usage: {program} inspect <file.dex>");
-    eprintln!("       {program} decompile [--no-metadata] <file.dex> <class-descriptor>");
     eprintln!(
-        "       {program} export-all [--no-metadata] <file.dex|file.apk> [output-directory]"
+        "       {program} decompile [--no-metadata] [--debug] <file.dex> <class-descriptor>"
     );
     eprintln!(
-        "       {program} export-all-parallel [--no-metadata] <file.dex|file.apk> [thread-count] [output-directory]"
+        "       {program} export-all [--no-metadata] [--debug] <file.dex|file.apk> [output-directory]"
+    );
+    eprintln!(
+        "       {program} export-all-parallel [--no-metadata] [--debug] <file.dex|file.apk> [thread-count] [output-directory]"
     );
     eprintln!("       (thread-count defaults to half the available logical CPU count)");
 }
@@ -278,6 +289,26 @@ fn take_metadata_option(args: &mut Vec<OsString>) -> Option<bool> {
         Some(false)
     } else {
         Some(true)
+    }
+}
+
+fn take_debug_option(args: &mut Vec<OsString>) -> Option<bool> {
+    let mut found = None;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == OsStr::new("--debug") {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(index);
+        }
+        index += 1;
+    }
+    if let Some(index) = found {
+        args.remove(index);
+        Some(true)
+    } else {
+        Some(false)
     }
 }
 
@@ -339,8 +370,9 @@ fn export_dex_to_directory(
     output_directory: &Path,
     thread_count: Option<usize>,
     include_metadata: bool,
+    debug: bool,
 ) -> crate::Result<usize> {
-    let decompiler = Decompiler::parse(dex_bytes)?;
+    let decompiler = Decompiler::parse(dex_bytes)?.with_debug(debug);
     let decompiler = if include_metadata {
         decompiler
     } else {
@@ -992,6 +1024,7 @@ fn process_apk_parallel<F>(
     input: &Path,
     thread_count: usize,
     include_metadata: bool,
+    debug: bool,
     progress_callback: Option<&(dyn Fn(ExportProgress) + Send + Sync)>,
     emit_chunk: F,
 ) -> crate::Result<(usize, usize)>
@@ -1060,7 +1093,8 @@ where
                             let result =
                                 read_apk_dex(&apk, entry, &mut decompressor).and_then(|bytes| {
                                     let decompiler =
-                                        Decompiler::parse_owned(Arc::from(bytes))?;
+                                        Decompiler::parse_owned(Arc::from(bytes))?
+                                            .with_debug(debug);
                                     let decompiler = if include_metadata {
                                         decompiler
                                     } else {
@@ -1231,12 +1265,14 @@ fn export_apk_parallel_to_directory(
     output_directory: &Path,
     thread_count: usize,
     include_metadata: bool,
+    debug: bool,
     progress_callback: Option<&(dyn Fn(ExportProgress) + Send + Sync)>,
 ) -> crate::Result<(usize, usize)> {
     process_apk_parallel(
         input,
         thread_count,
         include_metadata,
+        debug,
         progress_callback,
         |_, _, records| {
             for (descriptor, source) in records {
@@ -1278,8 +1314,9 @@ fn decompile_dex_binary(
     dex_bytes: &[u8],
     thread_count: usize,
     include_metadata: bool,
+    debug: bool,
 ) -> crate::Result<BinaryDexOutput> {
-    let decompiler = Decompiler::parse(dex_bytes)?;
+    let decompiler = Decompiler::parse(dex_bytes)?.with_debug(debug);
     let decompiler = if include_metadata {
         decompiler
     } else {
@@ -1357,6 +1394,7 @@ pub fn export_to_directory(
             output_directory,
             thread_count.unwrap_or(1),
             options.include_metadata,
+            options.debug,
             options.progress_callback.as_deref(),
         )?
     } else {
@@ -1368,6 +1406,7 @@ pub fn export_to_directory(
                 output_directory,
                 thread_count,
                 options.include_metadata,
+                options.debug,
             )?,
         )
     };
@@ -1405,6 +1444,7 @@ pub fn export_to_writer(
             input,
             thread_count.unwrap_or(1),
             options.include_metadata,
+            options.debug,
             options.progress_callback.as_deref(),
             |dex_number, start_class, chunk| {
                 records
@@ -1424,6 +1464,7 @@ pub fn export_to_writer(
             &bytes,
             thread_count.unwrap_or(1),
             options.include_metadata,
+            options.debug,
         )?;
         (1, dex.class_count as usize, None, Some(dex.payload))
     };
@@ -1469,6 +1510,14 @@ pub fn run() -> crate::Result<()> {
     } else {
         true
     };
+    let debug = if supports_metadata_option {
+        take_debug_option(&mut command_args).unwrap_or_else(|| {
+            usage(&program);
+            std::process::exit(2);
+        })
+    } else {
+        false
+    };
     let mut args = command_args.into_iter();
     let path = args.next();
     match command.as_deref() {
@@ -1497,7 +1546,12 @@ pub fn run() -> crate::Result<()> {
                 std::process::exit(2);
             }
             let source =
-                decompile_class_file_configured(Path::new(&path), &class, include_metadata)?
+                decompile_class_file_configured(
+                    Path::new(&path),
+                    &class,
+                    include_metadata,
+                    debug,
+                )?
                 .map(|output| output.source)
                 .unwrap_or_else(|| {
                     format!("Error: Class {class} not found in the reconstructed DEX.")
@@ -1520,6 +1574,7 @@ pub fn run() -> crate::Result<()> {
             } else {
                 ExportOptions::default().without_metadata()
             }
+            .with_debug(debug)
             .with_progress(cli_progress);
             if let Some(output_directory) = output_directory {
                 let summary =
@@ -1567,6 +1622,7 @@ pub fn run() -> crate::Result<()> {
                 ExportOptions::default().without_metadata()
             }
             .with_threads(thread_count)
+            .with_debug(debug)
             .with_progress(cli_progress);
             if let Some(output_directory) = output_directory {
                 let summary =

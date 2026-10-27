@@ -1,8 +1,9 @@
+use std::borrow::Cow;
 use std::collections::{hash_map::Entry, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::graph::{Graph, NodeId};
-use crate::ir::{Statement, VariableId};
+use crate::ir::{Statement, Value, VariableId};
 
 pub type Location = usize;
 
@@ -767,6 +768,13 @@ fn split_variables_at(
                 definition_versions.insert((variable, definition), replacement);
             }
             if replacement != variable {
+                if let Some(ty) = infer_definition_group_type(graph, locations, &definitions) {
+                    graph
+                        .variables
+                        .get_mut(replacement)
+                        .expect("created version variable")
+                        .ty = Some(ty);
+                }
                 for location in uses {
                     let statement = locations.get(location);
                     let mut remap = |candidate| {
@@ -799,6 +807,61 @@ fn split_variables_at(
         }
     }
     remap_definition_chain_variables(chains, &definition_versions);
+}
+
+fn infer_definition_group_type(
+    graph: &Graph,
+    locations: &LocationIndex,
+    definitions: &[Definition],
+) -> Option<Cow<'static, str>> {
+    let mut inferred = None;
+    for definition in definitions {
+        let Definition::Instruction(location) = definition else {
+            continue;
+        };
+        let statement_location = locations.get(*location);
+        let statement =
+            &graph.nodes[statement_location.node].statements[statement_location.index];
+        let ty = match statement {
+            Statement::Assign { rhs, .. } => value_type(rhs, graph),
+            Statement::MoveException { ty, .. } => ty.as_deref().map(str::to_owned).map(Cow::Owned),
+            _ => None,
+        };
+        let Some(ty) = ty else {
+            continue;
+        };
+        if inferred
+            .as_deref()
+            .is_some_and(|existing: &str| existing != ty.as_ref())
+        {
+            return None;
+        }
+        inferred = Some(ty);
+    }
+    inferred
+}
+
+fn value_type(value: &Value, graph: &Graph) -> Option<Cow<'static, str>> {
+    match value {
+        Value::Variable(variable) => graph.variables.get(*variable).and_then(|info| info.ty.clone()),
+        Value::Constant(constant) => Some(Cow::Borrowed(constant.ty())),
+        Value::NewInstance { ty } => Some(Cow::Owned(ty.clone())),
+        Value::Invoke(invoke) => Some(Cow::Owned(invoke.method.return_type.clone())),
+        Value::CheckCast(cast) => Some(Cow::Owned(cast.descriptor.clone())),
+        Value::ArrayLength(_) => Some(Cow::Borrowed("I")),
+        Value::NewArray(array) => Some(Cow::Owned(array.ty.clone())),
+        Value::FilledArray(array) => Some(Cow::Owned(array.ty.clone())),
+        Value::Binary(binary) => Some(Cow::Borrowed(binary.ty)),
+        Value::Unary(unary) => Some(Cow::Borrowed(unary.ty)),
+        Value::ArrayLoad(load) => {
+            value_type(&load.array, graph)
+                .and_then(|ty| ty.strip_prefix('[').map(|element| Cow::Owned(element.to_owned())))
+                .or_else(|| load.ty.map(Cow::Borrowed))
+        }
+        Value::InstanceField(field) => Some(Cow::Owned(field.field.ty.to_string())),
+        Value::StaticField(field) => Some(Cow::Owned(field.ty.to_string())),
+        Value::BaseClass { .. } => Some(Cow::Borrowed("Ljava/lang/Class;")),
+    }
 }
 
 fn remap_definition_chain_variables(
