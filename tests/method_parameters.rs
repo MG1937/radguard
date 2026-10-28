@@ -30,6 +30,12 @@ fn interface_methods_keep_prototype_parameters_without_code() {
         "public abstract void mixed(int p0, long p1, double p2, String p3, int[] p4);",
     );
     assert_contains(&output.source, "public abstract void noParameters();");
+    assert_contains(&output.source, "public abstract void overloaded();");
+    assert_contains(&output.source, "public abstract void overloaded(int p0);");
+    assert_contains(
+        &output.source,
+        "public abstract void overloaded(long p0, double p1);",
+    );
 }
 
 #[test]

@@ -15,6 +15,7 @@ import struct
 import subprocess
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 
@@ -732,6 +733,129 @@ def descriptor_to_java(descriptor: str) -> str:
         name = descriptor[1:-1].replace("/", ".")
         return name.removeprefix("java.lang.")
     return descriptor
+
+
+def bodyless_parameter_oracle(dex_bytes: bytes) -> dict[str, list[tuple[str, str, list[str]]]]:
+    """Read declarations from the original DEX, independently of either decompiler.
+
+    This small metadata-only reader supports the standalone DEX 035-040 fixtures.
+    Records follow class_data order (direct methods, then virtual methods), which
+    also preserves overloads whose signatures collapse to the same DAD text.
+    """
+    if (
+        len(dex_bytes) < 112
+        or dex_bytes[:4] != b"dex\n"
+        or dex_bytes[4:8] not in (b"035\0", b"036\0", b"037\0", b"038\0", b"039\0", b"040\0")
+        or struct.unpack_from("<III", dex_bytes, 32) != (len(dex_bytes), 112, 0x12345678)
+    ):
+        raise ValueError("parameter oracle requires a standalone little-endian DEX 035-040")
+
+    def u32(offset: int) -> int:
+        return struct.unpack_from("<I", dex_bytes, offset)[0]
+
+    def uleb(offset: int) -> tuple[int, int]:
+        value = 0
+        for shift in range(0, 35, 7):
+            byte = dex_bytes[offset]
+            offset += 1
+            if shift == 28 and byte > 0x0F:
+                break
+            value |= (byte & 0x7F) << shift
+            if byte < 0x80:
+                return value, offset
+        raise ValueError("invalid DEX uleb128 in parameter oracle")
+
+    string_count, string_offset = struct.unpack_from("<II", dex_bytes, 56)
+    strings = []
+    for index in range(string_count):
+        _, start = uleb(u32(string_offset + 4 * index))
+        raw = dex_bytes[start:dex_bytes.index(b"\0", start)]
+        # DEX MUTF-8 encodes NUL specially and supplementary characters as
+        # UTF-16 surrogate pairs, even in strings unrelated to method names.
+        text = raw.replace(b"\xc0\x80", b"\0").decode("utf-8", errors="surrogatepass")
+        strings.append(text.encode("utf-16-le", errors="surrogatepass").decode(
+            "utf-16-le", errors="surrogatepass"
+        ))
+
+    type_count, type_offset = struct.unpack_from("<II", dex_bytes, 64)
+    types = [strings[u32(type_offset + 4 * index)] for index in range(type_count)]
+    proto_count, proto_offset = struct.unpack_from("<II", dex_bytes, 72)
+    protos = []
+    for index in range(proto_count):
+        _, return_index, parameters_offset = struct.unpack_from("<III", dex_bytes, proto_offset + 12 * index)
+        parameter_indices = (
+            struct.unpack_from(f"<{u32(parameters_offset)}H", dex_bytes, parameters_offset + 4)
+            if parameters_offset else ()
+        )
+        protos.append((types[return_index], [types[i] for i in parameter_indices]))
+
+    method_count, method_offset = struct.unpack_from("<II", dex_bytes, 88)
+    methods = [struct.unpack_from("<HHI", dex_bytes, method_offset + 8 * i) for i in range(method_count)]
+    class_count, class_offset = struct.unpack_from("<II", dex_bytes, 96)
+    result = {}
+    for index in range(class_count):
+        offset = class_offset + 32 * index
+        descriptor = types[u32(offset)]
+        cursor = u32(offset + 24)
+        if cursor == 0:
+            continue
+        counts = []
+        for _ in range(4):
+            count, cursor = uleb(cursor)
+            counts.append(count)
+        for _ in range(2 * (counts[0] + counts[1])):
+            _, cursor = uleb(cursor)
+        declarations = []
+        for count in counts[2:]:
+            method_index = 0
+            for _ in range(count):
+                difference, cursor = uleb(cursor)
+                method_index += difference
+                _, cursor = uleb(cursor)  # access_flags
+                code_offset, cursor = uleb(cursor)
+                if code_offset == 0:
+                    owner_index, proto_index, name_index = methods[method_index]
+                    if types[owner_index] != descriptor:
+                        raise ValueError("DEX method owner differs from its class_data")
+                    return_type, parameters = protos[proto_index]
+                    declarations.append((return_type, strings[name_index], parameters))
+        if declarations:
+            result[descriptor] = declarations
+    return result
+
+
+BODYLESS_DECLARATION_RE = re.compile(
+    r"^(?P<prefix> {4}(?:(?:public|protected|private|abstract|static|final|"
+    r"synchronized|bridge|varargs|native|strictfp|synthetic|declared_synchronized|unkn_\d+) )*"
+    r"(?P<return_type>\S+) (?P<name>[^\s()]+))\((?P<parameters>[^()]*)\);$"
+)
+
+
+def restore_dad_bodyless_parameters(
+    source: str, declarations: list[tuple[str, str, list[str]]]
+) -> str:
+    """Repair only missing DAD parameters; never normalize candidate signatures.
+
+    Fail closed if frozen declarations do not match the DEX method order, rather
+    than guessing which prototype belongs to an overloaded declaration.
+    """
+    pending = deque(declarations)
+    lines = []
+    for line in source.splitlines(keepends=True):
+        match = BODYLESS_DECLARATION_RE.fullmatch(line.rstrip("\r\n"))
+        if match is not None:
+            if not pending:
+                raise ValueError("unexpected bodyless declaration in frozen DAD output")
+            return_type, name, parameters = pending.popleft()
+            if (match["return_type"], match["name"]) != (descriptor_to_java(return_type), name):
+                raise ValueError(f"frozen DAD declaration does not match DEX method {name}")
+            if not match["parameters"]:
+                rendered = ", ".join(f"{descriptor_to_java(ty)} p{i}" for i, ty in enumerate(parameters))
+                line = line[:match.start("parameters")] + rendered + line[match.end("parameters"):]
+        lines.append(line)
+    if pending:
+        raise ValueError("missing bodyless declaration in frozen DAD output")
+    return "".join(lines)
 
 
 def boolean_array_load_oracle(dex_bytes: bytes) -> dict[str, list[int]]:
@@ -2950,9 +3074,13 @@ def compare_class(task):
         split_inline_consts,
         catch_types,
         dad_type_corrections,
+        bodyless_parameters,
     ) = task
     dad_normalized, rust_normalized = normalize_filled_string_ranges(
-        normalize_dad_type_names(dad_source or "", dad_type_corrections),
+        restore_dad_bodyless_parameters(
+            normalize_dad_type_names(dad_source or "", dad_type_corrections),
+            bodyless_parameters,
+        ),
         rust_source or "",
         filled_string_ranges,
     )
@@ -3076,6 +3204,7 @@ def compare(
     split_inline_consts = oracles["split_inline_consts"]
     catch_types = oracles["catch_types"]
     dad_type_corrections = oracles["dad_type_corrections"]
+    bodyless_parameters = bodyless_parameter_oracle(dex_bytes)
     rust, first_rust_seconds = decompile_rust(
         executable,
         dex_path,
@@ -3108,6 +3237,7 @@ def compare(
             split_inline_consts.get(name, []),
             catch_types.get(name, []),
             dad_type_corrections,
+            bodyless_parameters.get(name, []),
         )
         for name in names
     )

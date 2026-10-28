@@ -5,7 +5,7 @@ declarations without code. `../method_parameters.dex` is assembled from these
 sources; it contains no code copied from an application.
 
 - `ParameterInterface`: a single `long` parameter, mixed narrow/wide/reference/
-  array parameters, and a zero-parameter declaration.
+  array parameters, zero parameters, and three overloads of the same method.
 - `AbstractParameters`: abstract mixed-parameter and zero-parameter methods.
 - `MethodParameters`: instance and static native methods, a constructor, and
   concrete instance/static methods with local registers and wide parameters.
@@ -24,8 +24,25 @@ java -cp "$SMALI_CLASSPATH" com.android.tools.smali.smali.Main assemble \
   --api 21 --jobs 1 tests/fixtures/method_parameters \
   -o tests/fixtures/method_parameters.dex
 cargo test --locked --test method_parameters
+python3 -S -m unittest discover -s tests -p test_quality_gate.py
 ```
 
-The checked-in DEX is 1,228 bytes, with SHA-256
-`46037429a61d6c8788405ec28baaaf002c922945bb98cf6a09eda511a9cb785b`.
+The checked-in DEX is 1,308 bytes, with SHA-256
+`29161491f27e309cc8be8bfc8fc0e51f5c43f774a4ab15a86b8f6db0a5ec28f2`.
 Running the Rust tests does not require Java or Smali.
+
+The frozen DAD reference has the same missing-parameter bug. The quality gate
+reads `code_off` and method prototypes directly from the original DEX and fills
+only empty parameter lists in DAD declarations, preserving class-data order for
+overloads. Candidate output, mismatch thresholds, whitelists, and frozen cache
+files are unchanged. A missing or mismatched reference declaration fails the
+check. Comparator tests verify that missing, extra, reordered, or mistyped
+candidate parameters still fail, as do unrelated method-body changes.
+
+To verify this negative control against a pre-fix release binary:
+
+```sh
+python3 -S tests/quality_gate.py --phase 1 --no-build --rust-bin /path/to/old/radguard
+```
+
+That command must fail with 26 mismatching classes in `sample.dex`.

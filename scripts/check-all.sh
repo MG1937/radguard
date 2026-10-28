@@ -26,6 +26,9 @@ if [[ -x target/release/radguard.exe ]]; then
   rust_bin=target/release/radguard.exe
 fi
 
+echo '==> Quality comparator regression tests'
+"${python_cmd[@]}" -S -m unittest discover -s tests -p 'test_quality_gate.py'
+
 echo '==> Frozen DAD quality gates (Phase 1 = 0, Phase 2 <= 70)'
 "${python_cmd[@]}" -S tests/quality_gate.py \
   --phase 2 \

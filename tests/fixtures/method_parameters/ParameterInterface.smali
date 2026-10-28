@@ -9,3 +9,12 @@
 
 .method public abstract noParameters()V
 .end method
+
+.method public abstract overloaded()V
+.end method
+
+.method public abstract overloaded(I)V
+.end method
+
+.method public abstract overloaded(JD)V
+.end method

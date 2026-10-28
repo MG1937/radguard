@@ -7,6 +7,7 @@
 # Python sources, bytecode, environments, and caches
 *.py
 !/tests/quality_gate.py
+!/tests/test_quality_gate.py
 *.py[cod]
 __pycache__/
 .pytest_cache/
