@@ -7,6 +7,7 @@ import difflib
 import gzip
 import hashlib
 import importlib.util
+import json
 import os
 import pickle
 import re
@@ -128,7 +129,7 @@ FINAL_ARRAY_FIELD_RE = re.compile(
 RAW_LOCAL = r"(?:[vp]\d+(?:_\d+)?|vtmp\d+)"
 RAW_CATCH_RE = re.compile(
     rf"^(?P<prefix>\s*}}\s*catch \()"
-    rf"(?P<types>[A-Za-z_$][\w$.-]*(?: \| [A-Za-z_$][\w$.-]*)*)"
+    rf"(?P<types>[A-Za-z_$][\w$.-]*(?:\[\])*(?: \| [A-Za-z_$][\w$.-]*(?:\[\])*)*)"
     rf"(?P<variable> {RAW_LOCAL})?(?P<suffix>\) \{{)$"
 )
 RAW_BOOLEAN_ARRAY_NULL_RE = re.compile(
@@ -735,8 +736,13 @@ def descriptor_to_java(descriptor: str) -> str:
     return descriptor
 
 
-def bodyless_parameter_oracle(dex_bytes: bytes) -> dict[str, list[tuple[str, str, list[str]]]]:
-    """Read declarations from the original DEX, independently of either decompiler.
+CatchTarget = tuple[int | None, list[str]]
+
+
+def method_metadata_oracles(dex_bytes: bytes) -> tuple[
+    dict[str, list[tuple[str, str, list[str]]]], dict[str, list[list[CatchTarget]]]
+]:
+    """Read prototypes and handlers from DEX, independently of either decompiler.
 
     This small metadata-only reader supports the standalone DEX 035-040 fixtures.
     Records follow class_data order (direct methods, then virtual methods), which
@@ -748,7 +754,7 @@ def bodyless_parameter_oracle(dex_bytes: bytes) -> dict[str, list[tuple[str, str
         or dex_bytes[4:8] not in (b"035\0", b"036\0", b"037\0", b"038\0", b"039\0", b"040\0")
         or struct.unpack_from("<III", dex_bytes, 32) != (len(dex_bytes), 112, 0x12345678)
     ):
-        raise ValueError("parameter oracle requires a standalone little-endian DEX 035-040")
+        raise ValueError("method oracle requires a standalone little-endian DEX 035-040")
 
     def u32(offset: int) -> int:
         return struct.unpack_from("<I", dex_bytes, offset)[0]
@@ -779,6 +785,58 @@ def bodyless_parameter_oracle(dex_bytes: bytes) -> dict[str, list[tuple[str, str
 
     type_count, type_offset = struct.unpack_from("<II", dex_bytes, 64)
     types = [strings[u32(type_offset + 4 * index)] for index in range(type_count)]
+
+    def sleb(offset: int) -> tuple[int, int]:
+        value = 0
+        for shift in range(0, 35, 7):
+            byte = dex_bytes[offset]
+            offset += 1
+            value |= (byte & 0x7F) << shift
+            if byte < 0x80:
+                if byte & 0x40:
+                    value -= 1 << (shift + 7)
+                if -(1 << 31) <= value < (1 << 31):
+                    return value, offset
+                break
+        raise ValueError("invalid DEX sleb128 in method oracle")
+
+    def catch_type_groups(code_offset: int) -> list[CatchTarget]:
+        tries = struct.unpack_from("<H", dex_bytes, code_offset + 6)[0]
+        if tries == 0:
+            return []
+        tries_offset = (code_offset + 16 + 2 * u32(code_offset + 12) + 3) & ~3
+        handlers_offset = tries_offset + 8 * tries
+        handler_offsets = {
+            struct.unpack_from("<H", dex_bytes, tries_offset + 8 * i + 6)[0]
+            for i in range(tries)
+        }
+        targets: dict[int, set[tuple[str, ...]]] = {}
+        for offset in sorted(handler_offsets):
+            count, cursor = sleb(handlers_offset + offset)
+            groups: dict[int, list[str]] = {}
+            for _ in range(abs(count)):
+                type_index, cursor = uleb(cursor)
+                address, cursor = uleb(cursor)
+                group = groups.setdefault(address, [])
+                ty = descriptor_to_java(types[type_index])
+                if ty not in group:
+                    group.append(ty)
+            if count <= 0:
+                address, cursor = uleb(cursor)
+                group = groups.setdefault(address, [])
+                if "Throwable" not in group:
+                    group.append("Throwable")
+            for address, group in groups.items():
+                targets.setdefault(address, set()).add(tuple(group))
+        result = []
+        for address in sorted(targets):
+            if address >= u32(code_offset + 12):
+                raise ValueError("DEX handler address is outside its code item")
+            instruction = struct.unpack_from("<H", dex_bytes, code_offset + 16 + 2 * address)[0]
+            register = instruction >> 8 if instruction & 0xFF == 0x0D else None
+            result.extend((register, list(group)) for group in sorted(targets[address]))
+        return result
+
     proto_count, proto_offset = struct.unpack_from("<II", dex_bytes, 72)
     protos = []
     for index in range(proto_count):
@@ -793,6 +851,7 @@ def bodyless_parameter_oracle(dex_bytes: bytes) -> dict[str, list[tuple[str, str
     methods = [struct.unpack_from("<HHI", dex_bytes, method_offset + 8 * i) for i in range(method_count)]
     class_count, class_offset = struct.unpack_from("<II", dex_bytes, 96)
     result = {}
+    raw_catches = {}
     for index in range(class_count):
         offset = class_offset + 32 * index
         descriptor = types[u32(offset)]
@@ -806,6 +865,7 @@ def bodyless_parameter_oracle(dex_bytes: bytes) -> dict[str, list[tuple[str, str
         for _ in range(2 * (counts[0] + counts[1])):
             _, cursor = uleb(cursor)
         declarations = []
+        catch_types = []
         for count in counts[2:]:
             method_index = 0
             for _ in range(count):
@@ -819,9 +879,17 @@ def bodyless_parameter_oracle(dex_bytes: bytes) -> dict[str, list[tuple[str, str
                         raise ValueError("DEX method owner differs from its class_data")
                     return_type, parameters = protos[proto_index]
                     declarations.append((return_type, strings[name_index], parameters))
+                else:
+                    catch_types.append(catch_type_groups(code_offset))
         if declarations:
             result[descriptor] = declarations
-    return result
+        if catch_types:
+            raw_catches[descriptor] = catch_types
+    return result, raw_catches
+
+
+def bodyless_parameter_oracle(dex_bytes: bytes) -> dict[str, list[tuple[str, str, list[str]]]]:
+    return method_metadata_oracles(dex_bytes)[0]
 
 
 BODYLESS_DECLARATION_RE = re.compile(
@@ -1152,8 +1220,56 @@ def method_sections(lines: list[str]) -> list[tuple[int, int]]:
     return sections
 
 
+def load_catch_annotations(dex_bytes: bytes, path: Path) -> dict[str, dict[int, dict]]:
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload["dex_sha256"] != hashlib.sha256(dex_bytes).hexdigest():
+        raise ValueError("frozen catch annotations do not match the original DEX")
+    result: dict[str, dict[int, dict]] = {}
+    for record in payload["records"]:
+        methods = result.setdefault(record["class_name"], {})
+        if record["method_index"] in methods:
+            raise ValueError("duplicate frozen catch annotation")
+        methods[record["method_index"]] = record
+    return result
+
+
+def restore_dad_catch_annotations(
+    source: str, annotations: dict[int, dict], raw_types: list[list[CatchTarget]],
+) -> str:
+    if not annotations:
+        return source
+    lines = source.splitlines()
+    sections = method_sections(lines)
+    for index, record in annotations.items():
+        if not 0 <= index < len(sections) or index >= len(raw_types):
+            raise ValueError("frozen catch annotation method is missing")
+        start, end = sections[index]
+        body = "\n".join(lines[start:end + 1])
+        if hashlib.sha256(body.encode()).hexdigest() != record["source_sha256"]:
+            raise ValueError("frozen catch annotation source has changed")
+        catches = [
+            (line, match) for line in range(start, end + 1)
+            if (match := RAW_CATCH_RE.match(lines[line])) is not None
+        ]
+        expected = record["catch_types"]
+        if len(catches) != len(expected):
+            raise ValueError("frozen catch annotation count has changed")
+        known_types = {ty for _, group in raw_types[index] for ty in group}
+        for (line, match), ty in zip(catches, expected):
+            if ty is None:
+                continue
+            if not ty or any(part not in known_types for part in ty.split(" | ")):
+                raise ValueError("frozen catch annotation type is absent from the DEX")
+            lines[line] = match["prefix"] + ty + (match["variable"] or "") + match["suffix"]
+    return "\n".join(lines)
+
+
 def normalize_dad_catch_types(
-    dad_source: str, rust_source: str, oracle: list[list[list[str]]]
+    dad_source: str, rust_source: str, oracle: list[list[list[str]]],
+    raw_types: list[list[CatchTarget]] | None = None,
+    annotated_methods: dict[int, dict] | None = None,
 ) -> tuple[str, str]:
     dad_lines = dad_source.splitlines()
     rust_lines = rust_source.splitlines()
@@ -1175,6 +1291,45 @@ def normalize_dad_catch_types(
             for index in range(rust_section[0], rust_section[1] + 1)
             if (match := RAW_CATCH_RE.match(rust_lines[index])) is not None
         ]
+        # Preserve every candidate type covered by an immutable instruction
+        # annotation; catches lacking that evidence retain the prior fallback.
+        annotation = (annotated_methods or {}).get(method_index, {})
+        raw_matched_catches = {
+            index for index, ty in enumerate(annotation.get("catch_types", []))
+            if ty is not None
+        }
+        if raw_types is not None and len(raw_types) == len(dad_methods):
+            targets = raw_types[method_index]
+            unique_types = {ty for _, group in targets for ty in group}
+            if len(unique_types) == 1:
+                known_type = unique_types.pop()
+                # Every handler in the original code item has this type, so
+                # repeated/shared handler rendering cannot make the match
+                # ambiguous. Correct only DAD; keep candidate types visible.
+                for index, match in dad_catches:
+                    dad_lines[index] = (
+                        match["prefix"] + known_type + (match["variable"] or "") + match["suffix"]
+                    )
+                continue
+            # Frozen DAD names preserve the DEX register as vN or vN_version.
+            # Match only when every handler using that register has the same
+            # types; neither handler traversal order nor candidate types are
+            # evidence for correcting the reference.
+            by_register: dict[int, set[tuple[str, ...]]] = {}
+            for register, group in targets:
+                if register is not None:
+                    by_register.setdefault(register, set()).add(tuple(group))
+            for catch_index, (index, match) in enumerate(dad_catches):
+                if catch_index in raw_matched_catches:
+                    continue
+                variable = re.fullmatch(r" v(\d+)(?:_\d+)?", match["variable"] or "")
+                groups = by_register.get(int(variable[1]), set()) if variable else set()
+                if len(groups) == 1:
+                    known_type = " | ".join(next(iter(groups)))
+                    dad_lines[index] = (
+                        match["prefix"] + known_type + match["variable"] + match["suffix"]
+                    )
+                    raw_matched_catches.add(catch_index)
         if not rust_catches or len(dad_catches) != len(rust_catches):
             continue
         expected_types = [types for types in expected]
@@ -1209,7 +1364,7 @@ def normalize_dad_catch_types(
                 can_skip = prefix[left][len(expected_types)] + suffix[left + 1][0] == best
                 if not can_skip and len(positions) == 1:
                     matched_catches.add(left)
-        for catch_index in matched_catches:
+        for catch_index in matched_catches - raw_matched_catches:
             dad_index, dad = dad_catches[catch_index]
             rust_index, rust = rust_catches[catch_index]
             token = f"__DEX_CATCH_{method_index}_{catch_index}__"
@@ -3075,10 +3230,15 @@ def compare_class(task):
         catch_types,
         dad_type_corrections,
         bodyless_parameters,
+        raw_catches,
+        catch_annotations,
     ) = task
     dad_normalized, rust_normalized = normalize_filled_string_ranges(
         restore_dad_bodyless_parameters(
-            normalize_dad_type_names(dad_source or "", dad_type_corrections),
+            normalize_dad_type_names(
+                restore_dad_catch_annotations(dad_source or "", catch_annotations, raw_catches),
+                dad_type_corrections,
+            ),
             bodyless_parameters,
         ),
         rust_source or "",
@@ -3088,6 +3248,8 @@ def compare_class(task):
         dad_normalized,
         rust_normalized,
         catch_types,
+        raw_catches,
+        catch_annotations,
     )
     rust_semantic = semantic_source(rust_normalized, dad_source=False)
     dad_semantic = semantic_source(dad_normalized, dad_source=True)
@@ -3204,7 +3366,10 @@ def compare(
     split_inline_consts = oracles["split_inline_consts"]
     catch_types = oracles["catch_types"]
     dad_type_corrections = oracles["dad_type_corrections"]
-    bodyless_parameters = bodyless_parameter_oracle(dex_bytes)
+    bodyless_parameters, raw_catches = method_metadata_oracles(dex_bytes)
+    catch_annotations = load_catch_annotations(
+        dex_bytes, Path(__file__).parent / "fixtures" / "dad_catch_types" / f"{dex_path.stem}.json",
+    )
     rust, first_rust_seconds = decompile_rust(
         executable,
         dex_path,
@@ -3238,6 +3403,8 @@ def compare(
             catch_types.get(name, []),
             dad_type_corrections,
             bodyless_parameters.get(name, []),
+            raw_catches.get(name, []),
+            catch_annotations.get(name, {}),
         )
         for name in names
     )
