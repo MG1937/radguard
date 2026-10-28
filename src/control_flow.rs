@@ -957,7 +957,32 @@ fn structure_catches(graph: &mut Graph, dominators: &[Option<NodeId>]) {
     for try_start in try_order {
         let wrapper = tries[&try_start];
         graph.replace_structural_references_before(try_start, wrapper, structural_node_count);
+        // Resolve adjacent, independent statement tries. Shared/nested
+        // handlers and values escaping the try need wider region analysis.
+        if let Some(follow) = graph.nodes[wrapper].try_follow
+            && let Some(next_try) = tries.get(&follow)
+            && is_independent_statement_try(graph, try_start)
+        {
+            graph.nodes[wrapper].try_follow = Some(*next_try);
+        }
     }
+}
+
+fn is_independent_statement_try(graph: &Graph, start: NodeId) -> bool {
+    let block = &graph.nodes[start];
+    block.kind == BlockKind::Statement
+        && block.successors.len() == 1
+        && block
+            .statements
+            .iter()
+            .all(|statement| statement.defined_variable().is_none())
+        && !block.catch_successors.is_empty()
+        && block.catch_successors.iter().all(|handler| {
+            let handler = &graph.nodes[*handler];
+            handler.kind == BlockKind::Return
+                && handler.catch_successors.is_empty()
+                && handler.catch_predecessors == [start]
+        })
 }
 
 fn common_dominator(
