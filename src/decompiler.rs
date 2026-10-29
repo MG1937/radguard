@@ -6,8 +6,13 @@ use crate::dex::{
 use crate::error::{Error, Result};
 use crate::graph::Graph;
 use crate::ir::opcode::lower_method_with_resolved;
-use crate::types::{class_access, descriptor_to_java, field_access, method_access};
-use crate::writer::{escape_java_string, MemberKind, MemberReference, MethodWriter, SourceOutput};
+use crate::types::{
+    class_access, descriptor_to_java, descriptor_to_java_enhanced, field_access, method_access,
+};
+use crate::writer::{
+    escape_java_string, format_java_char, format_java_f32, format_java_f64, MemberKind,
+    MemberReference, MethodWriter, SourceOutput,
+};
 
 pub struct Decompiler<'a> {
     dex: DexFile<'a>,
@@ -266,8 +271,17 @@ impl<'a> Decompiler<'a> {
             output.source.push_str(&modifiers.join(" "));
             output.source.push(' ');
         }
+        let generic_signature = if self.include_metadata {
+            self.extract_method_signature(annotations, resolved.parameter_type_indices.len())
+        } else {
+            None
+        };
         if !constructor {
-            output.source.push_str(&descriptor_to_java(return_type));
+            if let Some((_, ref ret_ty)) = generic_signature {
+                output.source.push_str(ret_ty);
+            } else {
+                output.source.push_str(&descriptor_to_java(return_type));
+            }
             output.source.push(' ');
         }
         let displayed_name = if constructor {
@@ -287,7 +301,8 @@ impl<'a> Decompiler<'a> {
             declaration: true,
         });
 
-        let lowered = lower_method_with_resolved(&self.dex, method, resolved)?;
+        let lowered =
+            lower_method_with_resolved(&self.dex, method, resolved, self.include_metadata)?;
         let mut graph = lowered.map(Graph::from_lowered);
         let parameter_registers = graph
             .as_ref()
@@ -313,9 +328,15 @@ impl<'a> Decompiler<'a> {
             if index != 0 {
                 output.source.push_str(", ");
             }
-            output
-                .source
-                .push_str(&descriptor_to_java(parameter_type));
+            if let Some((ref param_types, _)) = generic_signature
+                && let Some(generic_param) = param_types.get(index)
+            {
+                output.source.push_str(generic_param);
+            } else {
+                output
+                    .source
+                    .push_str(&descriptor_to_java(parameter_type));
+            }
             output.source.push(' ');
             output.source.push('p');
             let name = parameter_registers.get(index).and_then(|parameter| {
@@ -338,7 +359,11 @@ impl<'a> Decompiler<'a> {
         if self.debug {
             graph.debug_dump("lowered");
         }
-        dataflow::optimize_for_decompilation(graph);
+        if self.include_metadata {
+            dataflow::optimize_for_decompilation_enhanced(graph, return_type);
+        } else {
+            dataflow::optimize_for_decompilation(graph);
+        }
         graph.split_condition_nodes();
         graph.simplify();
         graph.compute_rpo();
@@ -356,6 +381,7 @@ impl<'a> Decompiler<'a> {
                 constructor,
                 output,
                 self.debug,
+                self.include_metadata,
             )
             .write_body(),
         )
@@ -371,11 +397,37 @@ impl<'a> Decompiler<'a> {
                 }
             }
             EncodedValue::Short(value) => value.to_string(),
-            EncodedValue::Char(value) => value.to_string(),
+            EncodedValue::Char(value) => {
+                if self.include_metadata && field_type == "C" {
+                    format_java_char(*value)
+                } else {
+                    value.to_string()
+                }
+            }
             EncodedValue::Int(value) => value.to_string(),
-            EncodedValue::Long(value) => value.to_string(),
-            EncodedValue::Float(bits) => f32::from_bits(*bits).to_string(),
-            EncodedValue::Double(bits) => f64::from_bits(*bits).to_string(),
+            EncodedValue::Long(value) => {
+                if self.include_metadata {
+                    format!("{value}L")
+                } else {
+                    value.to_string()
+                }
+            }
+            EncodedValue::Float(bits) => {
+                let value = f32::from_bits(*bits);
+                if self.include_metadata {
+                    format_java_f32(value)
+                } else {
+                    value.to_string()
+                }
+            }
+            EncodedValue::Double(bits) => {
+                let value = f64::from_bits(*bits);
+                if self.include_metadata {
+                    format_java_f64(value)
+                } else {
+                    value.to_string()
+                }
+            }
             EncodedValue::String(index) => escape_java_string(self.dex.string(*index)?),
             EncodedValue::Type(index) => {
                 format!("{}.class", descriptor_to_java(self.dex.type_descriptor(*index)?))
@@ -413,10 +465,24 @@ impl<'a> Decompiler<'a> {
                     format!("@{name}({})", elements.join(", "))
                 }
             }
-            EncodedValue::Null if field_type == "Ljava/lang/String;" => "\"\"".to_owned(),
-            EncodedValue::Null => "None".to_owned(),
+            EncodedValue::Null if field_type == "Ljava/lang/String;" && !self.include_metadata => {
+                "\"\"".to_owned()
+            }
+            EncodedValue::Null => {
+                if self.include_metadata {
+                    "null".to_owned()
+                } else {
+                    "None".to_owned()
+                }
+            }
             EncodedValue::Boolean(value) => {
-                if *value {
+                if self.include_metadata {
+                    if *value {
+                        "true".to_owned()
+                    } else {
+                        "false".to_owned()
+                    }
+                } else if *value {
                     "True".to_owned()
                 } else {
                     "False".to_owned()
@@ -467,6 +533,149 @@ impl<'a> Decompiler<'a> {
             EncodedValue::Null => "null".to_owned(),
             _ => self.encoded_value(value, "")?,
         })
+    }
+
+    fn extract_method_signature(
+        &self,
+        annotations: &[EncodedAnnotation],
+        expected_params: usize,
+    ) -> Option<(Vec<String>, String)> {
+        for annotation in annotations {
+            let ty = self.dex.type_descriptor(annotation.type_idx).ok()?;
+            if ty != "Ldalvik/annotation/Signature;" {
+                continue;
+            }
+            for element in &annotation.elements {
+                if self.dex.string(element.name_idx).ok()? != "value" {
+                    continue;
+                }
+                let EncodedValue::Array(values) = &element.value else {
+                    continue;
+                };
+                let mut combined = String::new();
+                for val in values {
+                    let EncodedValue::String(idx) = val else {
+                        return None;
+                    };
+                    combined.push_str(self.dex.string(*idx).ok()?);
+                }
+                if let Some((params, ret)) = parse_dalvik_method_signature(&combined)
+                    && params.len() == expected_params
+                {
+                    return Some((params, ret));
+                }
+            }
+        }
+        None
+    }
+}
+
+fn parse_dalvik_method_signature(sig: &str) -> Option<(Vec<String>, String)> {
+    let mut chars = sig.chars().peekable();
+    if chars.peek() == Some(&'<') {
+        let mut depth = 0;
+        for ch in chars.by_ref() {
+            match ch {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if chars.next() != Some('(') {
+        return None;
+    }
+    let mut params = Vec::new();
+    while chars.peek().is_some_and(|&c| c != ')') {
+        params.push(parse_signature_type(&mut chars)?);
+    }
+    if chars.next() != Some(')') {
+        return None;
+    }
+    let ret = parse_signature_type(&mut chars)?;
+    Some((params, ret))
+}
+
+fn parse_signature_type(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    match chars.next()? {
+        'V' => Some("void".to_owned()),
+        'Z' => Some("boolean".to_owned()),
+        'B' => Some("byte".to_owned()),
+        'S' => Some("short".to_owned()),
+        'C' => Some("char".to_owned()),
+        'I' => Some("int".to_owned()),
+        'J' => Some("long".to_owned()),
+        'F' => Some("float".to_owned()),
+        'D' => Some("double".to_owned()),
+        '[' => {
+            let elem = parse_signature_type(chars)?;
+            Some(format!("{elem}[]"))
+        }
+        'T' => {
+            let mut name = String::new();
+            for ch in chars.by_ref() {
+                if ch == ';' {
+                    return (!name.is_empty()).then_some(name);
+                }
+                name.push(ch);
+            }
+            None
+        }
+        'L' => {
+            let mut raw = String::new();
+            let mut type_args = Vec::new();
+            loop {
+                match chars.next()? {
+                    ';' => break,
+                    '<' => {
+                        while chars.peek().is_some_and(|&c| c != '>') {
+                            type_args.push(parse_signature_type_argument(chars)?);
+                        }
+                        if chars.next() != Some('>') {
+                            return None;
+                        }
+                    }
+                    '.' => {
+                        raw.push('$');
+                    }
+                    ch => raw.push(ch),
+                }
+            }
+            let base = descriptor_to_java_enhanced(&format!("L{raw};"));
+            if type_args.is_empty() {
+                Some(base)
+            } else {
+                Some(format!("{base}<{}>", type_args.join(", ")))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_signature_type_argument(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<String> {
+    match chars.peek()? {
+        '*' => {
+            chars.next();
+            Some("?".to_owned())
+        }
+        '+' => {
+            chars.next();
+            let bound = parse_signature_type(chars)?;
+            Some(format!("? extends {bound}"))
+        }
+        '-' => {
+            chars.next();
+            let bound = parse_signature_type(chars)?;
+            Some(format!("? super {bound}"))
+        }
+        _ => parse_signature_type(chars),
     }
 }
 

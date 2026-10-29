@@ -3,7 +3,7 @@ use std::collections::{hash_map::Entry, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::graph::{Graph, NodeId};
-use crate::ir::{Statement, Value, VariableId};
+use crate::ir::{AssignKind, BinaryOp, Constant, ConstantValue, Statement, Value, VariableId};
 
 pub type Location = usize;
 
@@ -478,32 +478,48 @@ fn union_predecessor_transfer(
 }
 
 pub fn optimize(graph: &mut Graph) -> DefUseChains {
-    optimize_impl::<true>(graph)
+    optimize_impl::<true, false>(graph, "V")
 }
 
 pub(crate) fn optimize_for_decompilation(graph: &mut Graph) {
-    drop(optimize_impl::<false>(graph));
+    drop(optimize_impl::<false, false>(graph, "V"));
 }
 
-fn optimize_impl<const PRESERVE_CHAINS: bool>(graph: &mut Graph) -> DefUseChains {
+pub(crate) fn optimize_for_decompilation_enhanced(graph: &mut Graph, return_type: &str) {
+    drop(optimize_impl::<false, true>(graph, return_type));
+}
+
+fn optimize_impl<const PRESERVE_CHAINS: bool, const ENHANCED: bool>(
+    graph: &mut Graph,
+    return_type: &str,
+) -> DefUseChains {
     let (locations, definition_sites) = LocationIndex::build_with_definition_sites(graph);
     let mut chains = build_def_use_at(graph, &locations, &definition_sites);
     if !locations.has_instruction_definitions {
+        if ENHANCED {
+            recover_types_and_constants(graph, return_type);
+        }
         return chains;
     }
-    split_variables_at(graph, &mut chains, &locations);
+    split_variables_at::<ENHANCED>(graph, &mut chains, &locations);
     let mut live_locations = ActiveLocations::new(&locations);
     dead_code_elimination(graph, &locations, &mut live_locations, &mut chains);
     if chains.use_def.is_empty() && chains.def_use.is_empty() {
         compact_removed_without_index(graph, &locations, &live_locations);
+        if ENHANCED {
+            recover_types_and_constants(graph, return_type);
+        }
         return chains;
     }
     if !chains_have_instruction_definitions(&chains) {
         remap_chain_locations(&mut chains, &locations, &live_locations);
         compact_removed_without_index(graph, &locations, &live_locations);
+        if ENHANCED {
+            recover_types_and_constants(graph, return_type);
+        }
         return chains;
     }
-    register_propagation(
+    register_propagation::<ENHANCED>(
         graph,
         &locations,
         &mut live_locations,
@@ -512,10 +528,23 @@ fn optimize_impl<const PRESERVE_CHAINS: bool>(graph: &mut Graph) -> DefUseChains
     if PRESERVE_CHAINS {
         remap_chain_locations(&mut chains, &locations, &live_locations);
         let compacted_locations = compact_removed(graph, &locations, &live_locations);
-        place_declarations_at(graph, &chains, &compacted_locations, None);
+        place_declarations_at::<PRESERVE_CHAINS, ENHANCED>(
+            graph,
+            &chains,
+            &compacted_locations,
+            None,
+        );
     } else {
-        place_declarations_at(graph, &chains, &locations, Some(&live_locations));
+        place_declarations_at::<PRESERVE_CHAINS, ENHANCED>(
+            graph,
+            &chains,
+            &locations,
+            Some(&live_locations),
+        );
         compact_removed_without_index(graph, &locations, &live_locations);
+    }
+    if ENHANCED {
+        recover_types_and_constants(graph, return_type);
     }
     chains
 }
@@ -680,10 +709,10 @@ fn build_linear_def_use(graph: &Graph, locations: &LocationIndex) -> Option<DefU
 
 pub fn split_variables(graph: &mut Graph, chains: &mut DefUseChains) {
     let locations = LocationIndex::build(graph);
-    split_variables_at(graph, chains, &locations);
+    split_variables_at::<false>(graph, chains, &locations);
 }
 
-fn split_variables_at(
+fn split_variables_at<const ENHANCED: bool>(
     graph: &mut Graph,
     chains: &mut DefUseChains,
     locations: &LocationIndex,
@@ -694,6 +723,15 @@ fn split_variables_at(
             .entry(variable)
             .or_default()
             .push(definition);
+    }
+    if ENHANCED {
+        for parameter in graph.variables.parameter_ids() {
+            if let Some(defs) = definitions_by_variable.get_mut(&parameter)
+                && !defs.contains(&Definition::Parameter(parameter))
+            {
+                defs.push(Definition::Parameter(parameter));
+            }
+        }
     }
     let allow_integer_type_fix = graph.nodes.iter().any(|node| {
         let has_string_char_array = node.statements.iter().any(|statement| {
@@ -723,8 +761,11 @@ fn split_variables_at(
         definitions.sort_by_key(definition_order_key);
         definitions.dedup();
         let ordered_definitions = definitions.clone();
+        let has_parameter_def = ENHANCED
+            && ordered_definitions.first() == Some(&Definition::Parameter(variable))
+            && ordered_definitions.len() > 1;
         let mut remaining = vec![true; ordered_definitions.len()];
-        let mut groups = Vec::new();
+        let mut groups: Vec<(Vec<Definition>, Vec<Location>)> = Vec::new();
         let mut definition_queue = VecDeque::new();
         while let Some((_, start)) = ordered_definitions
             .iter()
@@ -747,13 +788,58 @@ fn split_variables_at(
                 }
                 remaining[definition_index] = false;
                 group_definitions.push(definition);
-                if let Some(uses) = chains.def_use.get(&(variable, definition)) {
-                    for &usage in uses {
+                if let Some(uses) = chains.def_use.get(&(variable, definition)).cloned() {
+                    for usage in uses {
+                        let skip_catch_spillover = has_parameter_def
+                            && matches!(definition, Definition::Instruction(def_loc) if !graph.nodes[locations.node(def_loc)].in_catch && graph.nodes[locations.node(def_loc)].catch_successors.contains(&locations.node(usage)))
+                            && graph.nodes[locations.node(usage)].in_catch
+                            && chains
+                                .use_def
+                                .get(&(variable, usage))
+                                .is_some_and(|reaching| {
+                                    reaching.iter().all(|cand| match cand {
+                                        Definition::Parameter(_) => true,
+                                        Definition::Instruction(loc) => {
+                                            let def_node = locations.node(*loc);
+                                            !graph.nodes[def_node].in_catch
+                                                && graph.nodes[def_node]
+                                                    .catch_successors
+                                                    .contains(&locations.node(usage))
+                                        }
+                                    })
+                                });
+                        if skip_catch_spillover {
+                            if let Some((param_defs, param_uses)) = groups.first_mut()
+                                && param_defs.contains(&Definition::Parameter(variable))
+                                && !param_uses.contains(&usage)
+                            {
+                                param_uses.push(usage);
+                                chains
+                                    .def_use
+                                    .entry((variable, Definition::Parameter(variable)))
+                                    .or_default()
+                                    .push(usage);
+                                if let Some(reaching) = chains.use_def.get_mut(&(variable, usage))
+                                    && !reaching.contains(&Definition::Parameter(variable))
+                                {
+                                    reaching.push(Definition::Parameter(variable));
+                                }
+                            }
+                            continue;
+                        }
                         if !use_marks[usage] {
                             use_marks[usage] = true;
                             group_uses.push(usage);
                             if let Some(reaching) = chains.use_def.get(&(variable, usage)) {
-                                definition_queue.extend(reaching.iter().copied());
+                                for &candidate in reaching {
+                                    let skip_reverse = has_parameter_def
+                                        && matches!(definition, Definition::Parameter(_))
+                                        && graph.nodes[locations.node(usage)].in_catch
+                                        && matches!(candidate, Definition::Instruction(def_loc) if !graph.nodes[locations.node(def_loc)].in_catch && graph.nodes[locations.node(def_loc)].catch_successors.contains(&locations.node(usage)));
+                                    if !skip_reverse {
+                                        definition_queue.push_back(candidate);
+                                    }
+                                }
                             }
                         }
                     }
@@ -774,9 +860,24 @@ fn split_variables_at(
             .expect("def-use references a known variable");
         for (version, (definitions, uses)) in groups.into_iter().enumerate() {
             let replacement = if definitions.contains(&Definition::Parameter(variable)) {
-                graph
-                    .variables
-                    .set_versioned_name(variable, &original_metadata, version);
+                if !ENHANCED {
+                    graph
+                        .variables
+                        .set_versioned_name(variable, &original_metadata, version);
+                } else {
+                    for &location in &uses {
+                        if let Some(reaching) = chains.use_def.get_mut(&(variable, location)) {
+                            reaching.retain(|def| definitions.contains(def));
+                        }
+                        for &other_def in &ordered_definitions {
+                            if !definitions.contains(&other_def)
+                                && let Some(def_uses) = chains.def_use.get_mut(&(variable, other_def))
+                            {
+                                def_uses.retain(|u| *u != location);
+                            }
+                        }
+                    }
+                }
                 variable
             } else {
                 graph
@@ -787,14 +888,15 @@ fn split_variables_at(
                 definition_versions.insert((variable, definition), replacement);
             }
             if replacement != variable {
-                if let Some(ty) = infer_definition_group_type(graph, locations, &definitions) {
+                if let Some(ty) = infer_definition_group_type::<ENHANCED>(graph, locations, &definitions) {
                     let original_type = graph
                         .variables
                         .get(replacement)
                         .and_then(|info| info.ty.as_deref());
-                    if original_type == Some("Ljava/lang/String;")
-                        && (ty.as_ref() == "[C"
-                            || (ty.as_ref() == "I" && allow_integer_type_fix))
+                    if (ENHANCED && ty.as_ref() != "unknownType")
+                        || (original_type == Some("Ljava/lang/String;")
+                            && (ty.as_ref() == "[C"
+                                || (ty.as_ref() == "I" && allow_integer_type_fix)))
                     {
                         graph
                             .variables
@@ -802,6 +904,12 @@ fn split_variables_at(
                             .expect("created version variable")
                             .ty = Some(ty);
                     }
+                } else if ENHANCED {
+                    graph
+                        .variables
+                        .get_mut(replacement)
+                        .expect("created version variable")
+                        .ty = None;
                 }
                 for location in uses {
                     let statement = locations.get(location);
@@ -814,13 +922,23 @@ fn split_variables_at(
                     };
                     graph.nodes[statement.node].statements[statement.index]
                         .remap_used_variables(&mut remap);
-                    let definitions = chains
+                    let mut reaching = chains
                         .use_def
                         .remove(&(variable, location))
                         .expect("split use has a use-def chain");
+                    if ENHANCED {
+                        reaching.retain(|def| definitions.contains(def));
+                        for &other_def in &ordered_definitions {
+                            if !definitions.contains(&other_def)
+                                && let Some(def_uses) = chains.def_use.get_mut(&(variable, other_def))
+                            {
+                                def_uses.retain(|u| *u != location);
+                            }
+                        }
+                    }
                     let previous = chains
                         .use_def
-                        .insert((replacement, location), definitions);
+                        .insert((replacement, location), reaching);
                     debug_assert!(previous.is_none());
                 }
             }
@@ -837,7 +955,7 @@ fn split_variables_at(
     remap_definition_chain_variables(chains, &definition_versions);
 }
 
-fn infer_definition_group_type(
+fn infer_definition_group_type<const ENHANCED: bool>(
     graph: &Graph,
     locations: &LocationIndex,
     definitions: &[Definition],
@@ -851,17 +969,39 @@ fn infer_definition_group_type(
         let statement =
             &graph.nodes[statement_location.node].statements[statement_location.index];
         let ty = match statement {
-            Statement::Assign { rhs, .. } => value_type(rhs, graph),
+            Statement::Assign { rhs, .. } => {
+                if let Value::Invoke(invoke) = rhs
+                    && invoke.method.name == "<init>"
+                    && invoke.method.return_type == "V"
+                {
+                    value_type(&invoke.base, graph)
+                } else {
+                    value_type(rhs, graph)
+                }
+            }
             Statement::MoveException { ty, .. } => ty.as_deref().map(str::to_owned).map(Cow::Owned),
             _ => None,
         };
         let Some(ty) = ty else {
             continue;
         };
-        if inferred
-            .as_deref()
-            .is_some_and(|existing: &str| existing != ty.as_ref())
-        {
+        if let Some(existing) = inferred.as_deref() {
+            if existing == ty.as_ref() {
+                continue;
+            }
+            if ENHANCED {
+                if existing == "I"
+                    && (ty.starts_with('L') || ty.starts_with('[') || ty.as_ref() == "Z")
+                {
+                    inferred = Some(ty);
+                    continue;
+                }
+                if ty.as_ref() == "I"
+                    && (existing.starts_with('L') || existing.starts_with('[') || existing == "Z")
+                {
+                    continue;
+                }
+            }
             return None;
         }
         inferred = Some(ty);
@@ -1085,7 +1225,7 @@ fn remove_live_location(
     live_locations.remove(locations, location);
 }
 
-fn register_propagation(
+fn register_propagation<const ENHANCED: bool>(
     graph: &mut Graph,
     locations: &LocationIndex,
     live_locations: &mut ActiveLocations,
@@ -1142,24 +1282,42 @@ fn register_propagation(
                     let definition_key =
                         (variable, Definition::Instruction(definition_location));
                     let is_constant = rhs.is_constant(&graph.variables);
+                    let is_compare_in_condition = ENHANCED
+                        && matches!(rhs, Value::Binary(binary) if binary.op == BinaryOp::Compare && !rhs.has_side_effect())
+                        && matches!(
+                            graph.nodes[statement_location.node].statements
+                                [statement_location.index],
+                            Statement::Condition { .. }
+                        );
                     let mut remove_single_use_definition = false;
                     if !is_constant {
                         if let Some(uses) = chains.def_use.get(&definition_key) {
-                            if uses.len() > 1 {
+                            if uses.len() > 1 && !is_compare_in_condition {
                                 continue;
                             }
                             remove_single_use_definition =
                                 matches!(uses.as_slice(), [usage] if *usage == use_location);
                         }
                         if origin_variables.iter().copied().any(|used| {
-                            !clear_path(
-                                graph,
-                                locations,
-                                live_locations,
-                                Some(used),
-                                definition_location,
-                                use_location,
-                            )
+                            if is_compare_in_condition {
+                                !clear_variable_path(
+                                    graph,
+                                    locations,
+                                    live_locations,
+                                    used,
+                                    definition_location,
+                                    use_location,
+                                )
+                            } else {
+                                !clear_path(
+                                    graph,
+                                    locations,
+                                    live_locations,
+                                    Some(used),
+                                    definition_location,
+                                    use_location,
+                                )
+                            }
                         }) {
                             continue;
                         }
@@ -1215,19 +1373,36 @@ fn register_propagation(
                         );
                     }
                     chains.use_def.remove(&(variable, use_location));
+                    let def_still_has_other_uses = !moved_rhs
+                        && !remove_single_use_definition
+                        && chains
+                            .def_use
+                            .get(&definition_key)
+                            .is_some_and(|uses| uses.iter().any(|usage| *usage != use_location));
                     for origin_variable in origin_variables.iter().copied() {
-                        let Some(old_definitions) = chains
-                            .use_def
-                            .remove(&(origin_variable, definition_location))
-                        else {
+                        let old_definitions = if def_still_has_other_uses {
+                            chains
+                                .use_def
+                                .get(&(origin_variable, definition_location))
+                                .cloned()
+                        } else {
+                            chains
+                                .use_def
+                                .remove(&(origin_variable, definition_location))
+                        };
+                        let Some(old_definitions) = old_definitions else {
                             continue;
                         };
                         for &old_definition in &old_definitions {
                             if let Some(uses) =
                                 chains.def_use.get_mut(&(origin_variable, old_definition))
                             {
-                                uses.retain(|usage| *usage != definition_location);
-                                uses.push(use_location);
+                                if !def_still_has_other_uses {
+                                    uses.retain(|usage| *usage != definition_location);
+                                }
+                                if !uses.contains(&use_location) {
+                                    uses.push(use_location);
+                                }
                             }
                         }
                         match chains.use_def.entry((origin_variable, use_location)) {
@@ -1240,6 +1415,15 @@ fn register_propagation(
                         }
                     }
                     if moved_rhs {
+                        if ENHANCED {
+                            update_chain(
+                                graph,
+                                locations,
+                                live_locations,
+                                chains,
+                                definition_location,
+                            );
+                        }
                         remove_live_location(
                             locations,
                             live_locations,
@@ -1248,6 +1432,15 @@ fn register_propagation(
                         changed = true;
                     } else if remove_single_use_definition {
                         if chains.def_use.remove(&definition_key).is_some() {
+                            if ENHANCED {
+                                update_chain(
+                                    graph,
+                                    locations,
+                                    live_locations,
+                                    chains,
+                                    definition_location,
+                                );
+                            }
                             remove_live_location(
                                 locations,
                                 live_locations,
@@ -1259,6 +1452,15 @@ fn register_propagation(
                         uses.retain(|usage| *usage != use_location);
                         if uses.is_empty() {
                             chains.def_use.remove(&definition_key);
+                            if ENHANCED {
+                                update_chain(
+                                    graph,
+                                    locations,
+                                    live_locations,
+                                    chains,
+                                    definition_location,
+                                );
+                            }
                             remove_live_location(
                                 locations,
                                 live_locations,
@@ -1339,10 +1541,10 @@ fn replace_with_definition_rhs(
 
 pub fn place_declarations(graph: &mut Graph, chains: &DefUseChains) {
     let locations = LocationIndex::build(graph);
-    place_declarations_at(graph, chains, &locations, None);
+    place_declarations_at::<true, false>(graph, chains, &locations, None);
 }
 
-fn place_declarations_at(
+fn place_declarations_at<const PRESERVE_CHAINS: bool, const ENHANCED: bool>(
     graph: &mut Graph,
     chains: &DefUseChains,
     locations: &LocationIndex,
@@ -1372,11 +1574,14 @@ fn place_declarations_at(
                     continue;
                 };
                 let mut definition_nodes = Vec::with_capacity(definitions.len());
+                let mut catch_definition_nodes = Vec::new();
                 for definition in definitions {
                     if let Definition::Instruction(location) = definition {
                         let definition_node = locations.node(*location);
                         if !graph.nodes[definition_node].in_catch {
                             definition_nodes.push(definition_node);
+                        } else if ENHANCED {
+                            catch_definition_nodes.push(definition_node);
                         }
                     }
                 }
@@ -1392,7 +1597,15 @@ fn place_declarations_at(
                     Definition::Instruction(location) => locations.node(*location) == common,
                     Definition::Parameter(_) => false,
                 });
-                if !defined_in_common && !graph.nodes[common].declarations.contains(&variable) {
+                let needs_hoisted_declaration = !defined_in_common
+                    || (ENHANCED
+                        && !catch_definition_nodes.is_empty()
+                        && (graph.nodes[common].catch_source
+                            || catch_definition_nodes
+                                .iter()
+                                .any(|&catch_node| catch_node != common)));
+                if needs_hoisted_declaration && !graph.nodes[common].declarations.contains(&variable)
+                {
                     graph.nodes[common].declarations.push(variable);
                 }
             }
@@ -1477,6 +1690,91 @@ fn clear_statement_range(
         })
 }
 
+fn clear_variable_path(
+    graph: &Graph,
+    locations: &LocationIndex,
+    live_locations: &ActiveLocations,
+    variable: VariableId,
+    from: Location,
+    to: Location,
+) -> bool {
+    if from >= to {
+        return false;
+    }
+    let from_location = locations.get(from);
+    let to_location = locations.get(to);
+    if from_location.node == to_location.node {
+        return clear_variable_statement_range(
+            graph,
+            locations,
+            live_locations,
+            from_location.node,
+            from_location.index + 1,
+            to_location.index,
+            variable,
+        );
+    }
+    if !clear_variable_statement_range(
+        graph,
+        locations,
+        live_locations,
+        from_location.node,
+        from_location.index + 1,
+        graph.nodes[from_location.node].statements.len(),
+        variable,
+    ) {
+        return false;
+    }
+
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::from([to_location.node]);
+    while let Some(node) = queue.pop_front() {
+        if node == from_location.node || !visited.insert(node) {
+            continue;
+        }
+        let end = if node == to_location.node {
+            to_location.index
+        } else {
+            graph.nodes[node].statements.len()
+        };
+        if !clear_variable_statement_range(
+            graph,
+            locations,
+            live_locations,
+            node,
+            0,
+            end,
+            variable,
+        ) {
+            return false;
+        }
+        queue.extend(graph.all_predecessors(node));
+    }
+    true
+}
+
+fn clear_variable_statement_range(
+    graph: &Graph,
+    locations: &LocationIndex,
+    live_locations: &ActiveLocations,
+    node: NodeId,
+    start: usize,
+    end: usize,
+    variable: VariableId,
+) -> bool {
+    graph.nodes[node].statements[start..end]
+        .iter()
+        .enumerate()
+        .all(|(relative, statement)| {
+            let index = start + relative;
+            let location = locations.node_locations(node)[index];
+            if live_locations.is_removed(location) {
+                return true;
+            }
+            statement.defined_variable() != Some(variable)
+        })
+}
+
 fn common_dominator(
     graph: &Graph,
     dominators: &[Option<NodeId>],
@@ -1543,6 +1841,584 @@ fn definition_sort_key(definition: &Definition) -> (u8, usize) {
     match definition {
         Definition::Parameter(_) => (0, 0),
         Definition::Instruction(location) => (1, *location),
+    }
+}
+
+fn fold_new_instance_constructors(graph: &mut Graph) {
+    let mut used = Vec::new();
+    for rpo_index in 0..graph.rpo.len() {
+        let node = graph.rpo[rpo_index];
+        let mut index = 0;
+        while index < graph.nodes[node].statements.len() {
+            let new_var_and_ty = match &graph.nodes[node].statements[index] {
+                Statement::Assign {
+                    lhs: Some(lhs),
+                    rhs: Value::NewInstance { ty },
+                    ..
+                } => Some((*lhs, ty.clone())),
+                _ => None,
+            };
+            let Some((new_var, new_ty)) = new_var_and_ty else {
+                index += 1;
+                continue;
+            };
+            let mut cursor = index + 1;
+            let mut folded = false;
+            while cursor < graph.nodes[node].statements.len() {
+                let statement = &graph.nodes[node].statements[cursor];
+                if let Statement::Assign {
+                    lhs,
+                    rhs: Value::Invoke(invoke),
+                    ..
+                } = statement
+                    && (lhs.is_none() || *lhs == Some(new_var))
+                    && invoke.method.name == "<init>"
+                    && invoke.method.class == new_ty
+                    && matches!(&invoke.base, Value::Variable(base) if *base == new_var)
+                {
+                    let arg_mentions_new_var = invoke.arguments.iter().any(|argument| {
+                        let mut arg_vars = HashSet::new();
+                        argument.used_variables(&mut arg_vars);
+                        arg_vars.contains(&new_var)
+                    });
+                    if !arg_mentions_new_var {
+                        if let Statement::Assign {
+                            lhs,
+                            rhs: Value::Invoke(invoke),
+                            ..
+                        } = &mut graph.nodes[node].statements[cursor]
+                        {
+                            *lhs = Some(new_var);
+                            invoke.base = Value::NewInstance { ty: new_ty };
+                        }
+                        graph.nodes[node].statements.remove(index);
+                        folded = true;
+                    }
+                    break;
+                }
+                used.clear();
+                statement.collect_used_variables_vec(&mut used);
+                if used.contains(&new_var) || statement.defined_variable() == Some(new_var) {
+                    break;
+                }
+                cursor += 1;
+            }
+            if !folded {
+                index += 1;
+            }
+        }
+    }
+}
+
+fn fold_string_builders(graph: &mut Graph) {
+    let mut used = Vec::new();
+    for rpo_index in 0..graph.rpo.len() {
+        let node = graph.rpo[rpo_index];
+        let mut index = 0;
+        while index < graph.nodes[node].statements.len() {
+            let init_var = match &graph.nodes[node].statements[index] {
+                Statement::Assign {
+                    lhs: Some(lhs),
+                    rhs: Value::Invoke(invoke),
+                    ..
+                } if invoke.method.class == "Ljava/lang/StringBuilder;"
+                    && invoke.method.name == "<init>"
+                    && matches!(&invoke.base, Value::NewInstance { ty } if ty == "Ljava/lang/StringBuilder;")
+                    && (invoke.arguments.is_empty()
+                        || (invoke.arguments.len() == 1
+                            && matches!(
+                                invoke.method.parameters.first().map(String::as_str),
+                                Some("I" | "Ljava/lang/String;" | "Ljava/lang/CharSequence;")
+                            ))) =>
+                {
+                    Some(*lhs)
+                }
+                _ => None,
+            };
+            let Some(sb_var) = init_var else {
+                index += 1;
+                continue;
+            };
+            let mut append_count = 0;
+            while index + 1 + append_count < graph.nodes[node].statements.len() {
+                let is_append = match &graph.nodes[node].statements[index + 1 + append_count] {
+                    Statement::Assign {
+                        lhs,
+                        rhs: Value::Invoke(invoke),
+                        ..
+                    } if (lhs.is_none() || *lhs == Some(sb_var))
+                        && invoke.method.class == "Ljava/lang/StringBuilder;"
+                        && invoke.method.name == "append"
+                        && invoke.arguments.len() == 1
+                        && matches!(&invoke.base, Value::Variable(base) if *base == sb_var) =>
+                    {
+                        let mut arg_vars = HashSet::new();
+                        invoke.arguments[0].used_variables(&mut arg_vars);
+                        !arg_vars.contains(&sb_var)
+                    }
+                    _ => false,
+                };
+                if is_append {
+                    append_count += 1;
+                } else {
+                    break;
+                }
+            }
+            if append_count == 0 || index + 1 + append_count >= graph.nodes[node].statements.len() {
+                index += 1;
+                continue;
+            }
+            let target_idx = index + 1 + append_count;
+            used.clear();
+            graph.nodes[node].statements[target_idx].collect_used_variables_vec(&mut used);
+            if !used.contains(&sb_var) {
+                index += 1;
+                continue;
+            }
+            let used_later_in_block = graph.nodes[node].statements[target_idx + 1..]
+                .iter()
+                .any(|stmt| {
+                    let mut v = Vec::new();
+                    stmt.collect_used_variables_vec(&mut v);
+                    v.contains(&sb_var) || stmt.defined_variable() == Some(sb_var)
+                });
+            let used_in_other_blocks = graph.rpo.iter().any(|&other_node| {
+                other_node != node
+                    && graph.nodes[other_node].statements.iter().any(|stmt| {
+                        let mut v = Vec::new();
+                        stmt.collect_used_variables_vec(&mut v);
+                        v.contains(&sb_var)
+                    })
+            });
+            if used_later_in_block || used_in_other_blocks {
+                index += 1;
+                continue;
+            }
+            let Statement::Assign {
+                rhs: init_value, ..
+            } = graph.nodes[node].statements.remove(index)
+            else {
+                unreachable!()
+            };
+            let mut chain = init_value;
+            for _ in 0..append_count {
+                let Statement::Assign {
+                    rhs: Value::Invoke(mut append_invoke),
+                    ..
+                } = graph.nodes[node].statements.remove(index)
+                else {
+                    unreachable!()
+                };
+                append_invoke.base = chain;
+                chain = Value::Invoke(append_invoke);
+            }
+            graph.nodes[node].statements[index].replace(sb_var, &chain);
+            for n in &mut graph.nodes {
+                n.declarations.retain(|decl| *decl != sb_var);
+            }
+        }
+    }
+}
+
+fn eliminate_identity_copies(graph: &mut Graph) {
+    for rpo_index in 0..graph.rpo.len() {
+        let node = graph.rpo[rpo_index];
+        let mut index = 0;
+        while index < graph.nodes[node].statements.len() {
+            let copy_pair = match &graph.nodes[node].statements[index] {
+                Statement::Assign {
+                    lhs: Some(lhs),
+                    rhs: Value::Variable(src),
+                    kind: AssignKind::Move | AssignKind::Normal,
+                } if lhs != src
+                    && !graph.variables.is_declared(*lhs)
+                    && !graph.variables.is_this(*lhs)
+                    && !graph.variables.is_super(*lhs) =>
+                {
+                    let lhs_ty = graph.variables.get(*lhs).and_then(|v| v.ty.as_deref());
+                    let src_ty = graph.variables.get(*src).and_then(|v| v.ty.as_deref());
+                    if lhs_ty == src_ty || lhs_ty.is_none() || lhs_ty == Some("Ljava/lang/Object;")
+                    {
+                        Some((*lhs, *src, false))
+                    } else {
+                        None
+                    }
+                }
+                Statement::Assign {
+                    lhs: Some(lhs),
+                    rhs: Value::CheckCast(cast),
+                    kind: AssignKind::Move | AssignKind::Normal,
+                } if cast.descriptor == "Ljava/lang/Iterable;"
+                    && matches!(&cast.value, Value::Variable(src) if src != lhs)
+                    && !graph.variables.is_declared(*lhs)
+                    && !graph.variables.is_this(*lhs)
+                    && !graph.variables.is_super(*lhs) =>
+                {
+                    let Value::Variable(src) = &cast.value else {
+                        unreachable!()
+                    };
+                    Some((*lhs, *src, true))
+                }
+                _ => None,
+            };
+            let Some((dst, src, is_iterable_cast)) = copy_pair else {
+                index += 1;
+                continue;
+            };
+            let other_defs_or_src_redef = graph.rpo.iter().any(|&nid| {
+                graph.nodes[nid]
+                    .statements
+                    .iter()
+                    .enumerate()
+                    .any(|(sidx, stmt)| {
+                        if nid == node && sidx == index {
+                            return false;
+                        }
+                        let def = stmt.defined_variable();
+                        def == Some(dst) || def == Some(src)
+                    })
+            });
+            if other_defs_or_src_redef {
+                index += 1;
+                continue;
+            }
+            if is_iterable_cast {
+                let only_used_in_iterator = graph.rpo.iter().all(|&nid| {
+                    graph.nodes[nid]
+                        .statements
+                        .iter()
+                        .enumerate()
+                        .all(|(sidx, stmt)| {
+                            if nid == node && sidx == index {
+                                return true;
+                            }
+                            let mut used = Vec::new();
+                            stmt.collect_used_variables_vec(&mut used);
+                            if !used.contains(&dst) {
+                                return true;
+                            }
+                            matches!(
+                                stmt,
+                                Statement::Assign {
+                                    rhs: Value::Invoke(inv),
+                                    ..
+                                } if inv.method.name == "iterator"
+                                    && inv.arguments.is_empty()
+                                    && matches!(&inv.base, Value::Variable(v) if *v == dst)
+                            )
+                        })
+                });
+                if !only_used_in_iterator {
+                    index += 1;
+                    continue;
+                }
+            }
+            graph.nodes[node].statements.remove(index);
+            let replacement = Value::Variable(src);
+            for &nid in &graph.rpo {
+                for stmt in &mut graph.nodes[nid].statements {
+                    stmt.replace(dst, &replacement);
+                }
+                graph.nodes[nid].declarations.retain(|d| *d != dst);
+            }
+        }
+    }
+}
+
+fn recover_types_and_constants(graph: &mut Graph, return_type: &str) {
+    fold_new_instance_constructors(graph);
+    fold_string_builders(graph);
+    for _ in 0..2 {
+        let mut changed = false;
+        for &node in &graph.rpo {
+            for index in 0..graph.nodes[node].statements.len() {
+                match &graph.nodes[node].statements[index] {
+                    Statement::Assign {
+                        lhs: Some(lhs),
+                        rhs,
+                        ..
+                    } => {
+                        let lhs = *lhs;
+                        let current_ty = graph
+                            .variables
+                            .get(lhs)
+                            .and_then(|info| info.ty.as_deref());
+                        let is_compare = matches!(
+                            rhs,
+                            Value::Binary(binary) if binary.op == BinaryOp::Compare
+                        );
+                        if is_compare && !graph.variables.is_declared(lhs) {
+                            if current_ty != Some("I") {
+                                if let Some(var) = graph.variables.get_mut(lhs) {
+                                    var.ty = Some(Cow::Borrowed("I"));
+                                    changed = true;
+                                }
+                            }
+                        } else if !graph.variables.is_declared(lhs)
+                            && let Some(inferred) = (if let Value::Invoke(invoke) = rhs
+                                && invoke.method.name == "<init>"
+                                && invoke.method.return_type == "V"
+                            {
+                                value_type(&invoke.base, graph)
+                            } else {
+                                value_type(rhs, graph)
+                            })
+                            && !matches!(inferred.as_ref(), "V" | "U" | "W" | "O" | "unknownType")
+                            && (current_ty.is_none_or(|ty| {
+                                matches!(ty, "V" | "U" | "W" | "O" | "unknownType")
+                            }) || (current_ty == Some("I")
+                                && (inferred.starts_with('L')
+                                    || inferred.starts_with('[')
+                                    || inferred.as_ref() == "Z"))
+                                || (current_ty == Some("Ljava/lang/Object;")
+                                    && (inferred.starts_with('L') || inferred.starts_with('['))
+                                    && inferred.as_ref() != "Ljava/lang/Object;"))
+                            && let Some(var) = graph.variables.get_mut(lhs)
+                        {
+                            var.ty = Some(inferred);
+                            changed = true;
+                        }
+                    }
+                    Statement::FillArray {
+                        array: Value::Variable(var),
+                        element_width,
+                        ..
+                    } => {
+                        let var = *var;
+                        let current_ty = graph
+                            .variables
+                            .get(var)
+                            .and_then(|info| info.ty.as_deref());
+                        if current_ty.is_none_or(|ty| matches!(ty, "U" | "W" | "O" | "unknownType")) {
+                            let inferred = match *element_width {
+                                1 => Some(Cow::Borrowed("[B")),
+                                2 => Some(Cow::Borrowed("[S")),
+                                4 => Some(Cow::Borrowed("[I")),
+                                8 => Some(Cow::Borrowed("[J")),
+                                _ => None,
+                            };
+                            if let Some(inferred) = inferred
+                                && let Some(info) = graph.variables.get_mut(var)
+                            {
+                                info.ty = Some(inferred);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Statement::Return(Some(Value::Variable(var))) => {
+                        let var = *var;
+                        let current_ty = graph
+                            .variables
+                            .get(var)
+                            .and_then(|info| info.ty.as_deref());
+                        if current_ty.is_none_or(|ty| {
+                            matches!(ty, "U" | "W" | "O" | "unknownType")
+                                || (ty == "I" && matches!(return_type, "Z" | "F" | "B" | "S" | "C"))
+                                || (ty == "J" && return_type == "D")
+                        }) && !graph.variables.is_declared(var)
+                            && return_type != "V"
+                            && let Some(info) = graph.variables.get_mut(var)
+                        {
+                            info.ty = Some(Cow::Owned(return_type.to_owned()));
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    eliminate_identity_copies(graph);
+
+    for _ in 0..2 {
+        for rpo_index in 0..graph.rpo.len() {
+            let node = graph.rpo[rpo_index];
+            for index in 0..graph.nodes[node].statements.len() {
+                let mut statement = std::mem::replace(
+                    &mut graph.nodes[node].statements[index],
+                    Statement::Nop,
+                );
+                propagate_statement_expected_types(&mut statement, graph, return_type);
+                graph.nodes[node].statements[index] = statement;
+            }
+        }
+    }
+}
+
+fn propagate_statement_expected_types(
+    statement: &mut Statement,
+    graph: &mut Graph,
+    return_type: &str,
+) {
+    match statement {
+        Statement::Assign { lhs, rhs, .. } => {
+            let expected = lhs
+                .and_then(|variable| graph.variables.get(variable))
+                .and_then(|info| info.ty.as_deref())
+                .map(str::to_owned);
+            propagate_value_expected_type(rhs, expected.as_deref(), graph);
+        }
+        Statement::ArrayStore(store) => {
+            propagate_value_expected_type(&mut store.array, None, graph);
+            propagate_value_expected_type(&mut store.index, Some("I"), graph);
+            let element_ty = value_type(&store.array, graph)
+                .and_then(|ty| ty.strip_prefix('[').map(|s| s.to_owned()))
+                .or_else(|| store.ty.map(str::to_owned));
+            propagate_value_expected_type(&mut store.value, element_ty.as_deref(), graph);
+        }
+        Statement::StaticPut { value, field } => {
+            let field_ty = field.ty.to_string();
+            propagate_value_expected_type(value, Some(&field_ty), graph);
+        }
+        Statement::InstancePut(store) => {
+            let class_ty = store.field.class.to_string();
+            let field_ty = store.field.ty.to_string();
+            propagate_value_expected_type(&mut store.object, Some(&class_ty), graph);
+            propagate_value_expected_type(&mut store.value, Some(&field_ty), graph);
+        }
+        Statement::Return(Some(value)) => {
+            propagate_value_expected_type(value, Some(return_type), graph);
+        }
+        Statement::MonitorEnter(value)
+        | Statement::MonitorExit(value)
+        | Statement::Throw(value) => {
+            propagate_value_expected_type(value, None, graph);
+        }
+        Statement::Switch { value, .. } => {
+            propagate_value_expected_type(value, Some("I"), graph);
+        }
+        Statement::FillArray { array, .. } => {
+            propagate_value_expected_type(array, None, graph);
+        }
+        Statement::Condition { left, right, .. } => {
+            if let Some(right) = right {
+                let left_ty = value_type(left, graph).map(|s| s.into_owned());
+                let right_ty = value_type(right, graph).map(|s| s.into_owned());
+                propagate_value_expected_type(left, right_ty.as_deref(), graph);
+                propagate_value_expected_type(right, left_ty.as_deref(), graph);
+            } else {
+                propagate_value_expected_type(left, None, graph);
+            }
+        }
+        Statement::Return(None) | Statement::Nop | Statement::MoveException { .. } => {}
+    }
+}
+
+fn propagate_value_expected_type(
+    value: &mut Value,
+    expected: Option<&str>,
+    graph: &mut Graph,
+) {
+    match value {
+        Value::Variable(variable) => {
+            if let Some(expected) = expected
+                && !graph.variables.is_declared(*variable)
+            {
+                let current_ty = graph
+                    .variables
+                    .get(*variable)
+                    .and_then(|info| info.ty.as_deref());
+                let new_ty = match (current_ty, expected) {
+                    (Some("I"), "F") => Some(Cow::Borrowed("F")),
+                    (Some("J"), "D") => Some(Cow::Borrowed("D")),
+                    (Some("I"), "Z") => Some(Cow::Borrowed("Z")),
+                    (Some("I"), "C") => Some(Cow::Borrowed("C")),
+                    (None | Some("U" | "W" | "O" | "unknownType"), other)
+                        if !matches!(other, "V" | "U" | "W" | "O" | "unknownType") =>
+                    {
+                        Some(Cow::Owned(other.to_owned()))
+                    }
+                    _ => None,
+                };
+                if let Some(new_ty) = new_ty
+                    && let Some(info) = graph.variables.get_mut(*variable)
+                {
+                    info.ty = Some(new_ty);
+                }
+            }
+        }
+        Value::Constant(Constant {
+            value: ConstantValue::Integer { value, ty },
+        }) => {
+            if let Some(expected) = expected {
+                match (*ty, expected) {
+                    ("I", "F") => *ty = "F",
+                    ("J", "D") => *ty = "D",
+                    ("I", "Z") => *ty = "Z",
+                    ("I", "C") => *ty = "C",
+                    ("I", other)
+                        if *value == 0
+                            && (other.starts_with('L')
+                                || other.starts_with('[')
+                                || other == "O") =>
+                    {
+                        *ty = "L";
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Value::Invoke(invoke) => {
+            let class_ty = invoke.method.class.clone();
+            propagate_value_expected_type(&mut invoke.base, Some(&class_ty), graph);
+            for (argument, param_ty) in invoke
+                .arguments
+                .iter_mut()
+                .zip(invoke.method.parameters.iter())
+            {
+                propagate_value_expected_type(argument, Some(param_ty.as_str()), graph);
+            }
+        }
+        Value::CheckCast(cast) => {
+            let descriptor = cast.descriptor.clone();
+            propagate_value_expected_type(&mut cast.value, Some(&descriptor), graph);
+        }
+        Value::Unary(unary) => {
+            let operand_expected = if unary.op == crate::ir::UnaryOp::Cast {
+                None
+            } else {
+                Some(unary.ty)
+            };
+            propagate_value_expected_type(&mut unary.value, operand_expected, graph);
+        }
+        Value::ArrayLoad(load) => {
+            propagate_value_expected_type(&mut load.array, None, graph);
+            propagate_value_expected_type(&mut load.index, Some("I"), graph);
+        }
+        Value::ArrayLength(array) => {
+            propagate_value_expected_type(array, None, graph);
+        }
+        Value::NewArray(array) => {
+            propagate_value_expected_type(&mut array.size, Some("I"), graph);
+        }
+        Value::FilledArray(array) => {
+            let element_ty = array.ty.strip_prefix('[').map(str::to_owned);
+            for argument in &mut array.arguments {
+                propagate_value_expected_type(argument, element_ty.as_deref(), graph);
+            }
+        }
+        Value::Binary(binary) => {
+            let (left_expected, right_expected) = match binary.op {
+                BinaryOp::ShiftLeft | BinaryOp::ShiftRight | BinaryOp::UnsignedShiftRight => {
+                    (Some(binary.ty), Some("I"))
+                }
+                BinaryOp::InstanceOf => (None, None),
+                _ => (Some(binary.ty), Some(binary.ty)),
+            };
+            propagate_value_expected_type(&mut binary.left, left_expected, graph);
+            propagate_value_expected_type(&mut binary.right, right_expected, graph);
+        }
+        Value::InstanceField(field) => {
+            let class_ty = field.field.class.to_string();
+            propagate_value_expected_type(&mut field.object, Some(&class_ty), graph);
+        }
+        Value::Constant(_)
+        | Value::BaseClass { .. }
+        | Value::NewInstance { .. }
+        | Value::StaticField(_) => {}
     }
 }
 

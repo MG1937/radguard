@@ -48,21 +48,23 @@ pub struct LoweredMethod {
 }
 
 pub fn lower_method(dex: &DexFile<'_>, method: &EncodedMethod) -> Result<Option<LoweredMethod>> {
-    lower_method_impl(dex, method, None)
+    lower_method_impl(dex, method, None, false)
 }
 
 pub(crate) fn lower_method_with_resolved(
     dex: &DexFile<'_>,
     method: &EncodedMethod,
     resolved: ResolvedMethod<'_>,
+    preserve_parameter_types: bool,
 ) -> Result<Option<LoweredMethod>> {
-    lower_method_impl(dex, method, Some(resolved))
+    lower_method_impl(dex, method, Some(resolved), preserve_parameter_types)
 }
 
 fn lower_method_impl(
     dex: &DexFile<'_>,
     method: &EncodedMethod,
     resolved: Option<ResolvedMethod<'_>>,
+    preserve_parameter_types: bool,
 ) -> Result<Option<LoweredMethod>> {
     let Some(code) = dex.code(method)? else {
         return Ok(None);
@@ -72,7 +74,7 @@ fn lower_method_impl(
         Some(resolved) => resolved,
         None => dex.method(method.method_idx)?,
     };
-    let mut lowerer = Lowerer::new(dex, method, &code, resolved)?;
+    let mut lowerer = Lowerer::new(dex, method, &code, resolved, preserve_parameter_types)?;
     let mut statements_by_block: Vec<Vec<Statement>> = analysis
         .blocks
         .iter()
@@ -91,11 +93,13 @@ fn lower_method_impl(
                 )?;
                 if let Some(Statement::MoveException { lhs, ty }) = &mut statement {
                     *ty = exception_type.clone();
-                    lowerer
-                        .variables
-                        .get_mut(*lhs)
-                        .expect("move-exception register exists")
-                        .ty = exception_type.clone().map(Cow::Owned);
+                    if !preserve_parameter_types || !lowerer.variables.is_declared(*lhs) {
+                        lowerer
+                            .variables
+                            .get_mut(*lhs)
+                            .expect("move-exception register exists")
+                            .ty = exception_type.clone().map(Cow::Owned);
+                    }
                 }
                 if let Some(statement) = statement {
                     let position = instruction_index - block.instructions.start;
@@ -195,6 +199,7 @@ fn lower_method_impl(
 struct Lowerer<'a> {
     dex: &'a DexFile<'a>,
     variables: VariableTable,
+    preserve_parameter_types: bool,
 }
 
 impl<'a> Lowerer<'a> {
@@ -203,6 +208,7 @@ impl<'a> Lowerer<'a> {
         method: &EncodedMethod,
         code: &CodeItem<'_>,
         resolved: ResolvedMethod<'_>,
+        preserve_parameter_types: bool,
     ) -> Result<Self> {
         let mut variables = VariableTable::default();
         let mut register = code
@@ -236,7 +242,11 @@ impl<'a> Lowerer<'a> {
                 .ok_or_else(|| Error::data(method.code_off as usize, "register overflow"))?;
         }
 
-        Ok(Self { dex, variables })
+        Ok(Self {
+            dex,
+            variables,
+            preserve_parameter_types,
+        })
     }
 
     fn variable(&mut self, register: u16) -> Value {
@@ -245,28 +255,30 @@ impl<'a> Lowerer<'a> {
 
     fn assign(&mut self, register: u16, rhs: Value, kind: AssignKind) -> Statement {
         let lhs = self.variables.register(register);
-        let inferred_type = match &rhs {
-            Value::Variable(source) => self
-                .variables
-                .get(*source)
-                .and_then(|variable| variable.ty.clone()),
-            Value::ArrayLoad(load) => array_element_type(&load.array, &self.variables)
-                .or_else(|| load.ty.map(Cow::Borrowed)),
-            Value::Constant(constant) => Some(Cow::Borrowed(constant.ty())),
-            Value::NewInstance { ty } => Some(Cow::Owned(ty.clone())),
-            Value::NewArray(array) => Some(Cow::Owned(array.ty.clone())),
-            Value::FilledArray(array) => Some(Cow::Owned(array.ty.clone())),
-            Value::CheckCast(cast) => Some(Cow::Owned(cast.descriptor.clone())),
-            Value::Binary(binary) => Some(Cow::Borrowed(binary.ty)),
-            Value::Unary(unary) => Some(Cow::Borrowed(unary.ty)),
-            Value::Invoke(invoke) => Some(Cow::Owned(invoke.method.return_type.clone())),
-            Value::ArrayLength(_) => Some(Cow::Borrowed("I")),
-            Value::InstanceField(field) => Some(Cow::Owned(field.field.ty.to_string())),
-            Value::StaticField(field) => Some(Cow::Owned(field.ty.to_string())),
-            Value::BaseClass { .. } => Some(Cow::Borrowed("Ljava/lang/Class;")),
-        };
-        if let Some(ty) = inferred_type {
-            self.variables.get_mut(lhs).expect("registered variable").ty = Some(ty);
+        if !self.preserve_parameter_types || !self.variables.is_declared(lhs) {
+            let inferred_type = match &rhs {
+                Value::Variable(source) => self
+                    .variables
+                    .get(*source)
+                    .and_then(|variable| variable.ty.clone()),
+                Value::ArrayLoad(load) => array_element_type(&load.array, &self.variables)
+                    .or_else(|| load.ty.map(Cow::Borrowed)),
+                Value::Constant(constant) => Some(Cow::Borrowed(constant.ty())),
+                Value::NewInstance { ty } => Some(Cow::Owned(ty.clone())),
+                Value::NewArray(array) => Some(Cow::Owned(array.ty.clone())),
+                Value::FilledArray(array) => Some(Cow::Owned(array.ty.clone())),
+                Value::CheckCast(cast) => Some(Cow::Owned(cast.descriptor.clone())),
+                Value::Binary(binary) => Some(Cow::Borrowed(binary.ty)),
+                Value::Unary(unary) => Some(Cow::Borrowed(unary.ty)),
+                Value::Invoke(invoke) => Some(Cow::Owned(invoke.method.return_type.clone())),
+                Value::ArrayLength(_) => Some(Cow::Borrowed("I")),
+                Value::InstanceField(field) => Some(Cow::Owned(field.field.ty.to_string())),
+                Value::StaticField(field) => Some(Cow::Owned(field.ty.to_string())),
+                Value::BaseClass { .. } => Some(Cow::Borrowed("Ljava/lang/Class;")),
+            };
+            if let Some(ty) = inferred_type {
+                self.variables.get_mut(lhs).expect("registered variable").ty = Some(ty);
+            }
         }
         Statement::Assign {
             lhs: Some(lhs),
@@ -327,7 +339,7 @@ impl<'a> Lowerer<'a> {
                 self.assign(
                     a,
                     Value::BaseClass {
-                        name: descriptor_to_java(&descriptor),
+                        name: descriptor_to_java(&descriptor, self.preserve_parameter_types),
                     },
                     AssignKind::Normal,
                 )
@@ -341,7 +353,7 @@ impl<'a> Lowerer<'a> {
                     a,
                     Value::CheckCast(Box::new(CheckCastExpression {
                         value: source,
-                        ty: descriptor_to_java(&descriptor),
+                        ty: descriptor_to_java(&descriptor, self.preserve_parameter_types),
                         descriptor,
                     })),
                     AssignKind::Normal,
@@ -354,7 +366,7 @@ impl<'a> Lowerer<'a> {
                     op: BinaryOp::InstanceOf,
                     left: self.variable(b),
                     right: Value::BaseClass {
-                        name: descriptor_to_java(&descriptor),
+                        name: descriptor_to_java(&descriptor, self.preserve_parameter_types),
                     },
                     ty: "Z",
                 }));
@@ -654,7 +666,7 @@ impl<'a> Lowerer<'a> {
         let (base, argument_registers) = if kind == InvokeKind::Static {
             (
                 Value::BaseClass {
-                    name: descriptor_to_java(resolved.class),
+                    name: descriptor_to_java(resolved.class, self.preserve_parameter_types),
                 },
                 used,
             )
@@ -706,7 +718,9 @@ impl<'a> Lowerer<'a> {
             if self.variables.is_this(receiver) {
                 None
             } else {
-                if resolved.name != "<init>" {
+                if resolved.name != "<init>"
+                    && (!self.preserve_parameter_types || !self.variables.is_declared(receiver))
+                {
                     self.variables
                         .get_mut(receiver)
                         .expect("registered receiver")
@@ -717,10 +731,12 @@ impl<'a> Lowerer<'a> {
             }
         } else if kind == InvokeKind::Super && instruction.opcode == 0x75 {
             let receiver = self.variables.register(used[0]);
-            self.variables
-                .get_mut(receiver)
-                .expect("registered receiver")
-                .ty = Some(Cow::Borrowed("V"));
+            if !self.preserve_parameter_types || !self.variables.is_declared(receiver) {
+                self.variables
+                    .get_mut(receiver)
+                    .expect("registered receiver")
+                    .ty = Some(Cow::Borrowed("V"));
+            }
             self.variables.set_last_result(receiver);
             Some(receiver)
         } else {
@@ -938,9 +954,9 @@ fn binary_spec(index: u16) -> (BinaryOp, &'static str) {
     }
 }
 
-fn descriptor_to_java(descriptor: &str) -> String {
+fn descriptor_to_java(descriptor: &str, enhanced: bool) -> String {
     if let Some(element) = descriptor.strip_prefix('[') {
-        return format!("{}[]", descriptor_to_java(element));
+        return format!("{}[]", descriptor_to_java(element, enhanced));
     }
     match descriptor {
         "V" => "void".to_owned(),
@@ -953,12 +969,23 @@ fn descriptor_to_java(descriptor: &str) -> String {
         "F" => "float".to_owned(),
         "D" => "double".to_owned(),
         "O" => "Object".to_owned(),
-        _ if descriptor.starts_with('L') && descriptor.ends_with(';') => descriptor
-            [1..descriptor.len() - 1]
-            .replace('/', ".")
-            .strip_prefix("java.lang.")
-            .unwrap_or(&descriptor[1..descriptor.len() - 1].replace('/', "."))
-            .to_owned(),
+        _ if descriptor.starts_with('L') && descriptor.ends_with(';') => {
+            let class = descriptor[1..descriptor.len() - 1].replace('/', ".");
+            if enhanced {
+                if let Some(rest) = class.strip_prefix("java.lang.")
+                    && !rest.contains('.')
+                {
+                    rest.to_owned()
+                } else {
+                    class
+                }
+            } else {
+                class
+                    .strip_prefix("java.lang.")
+                    .unwrap_or(&class)
+                    .to_owned()
+            }
+        }
         _ => descriptor.to_owned(),
     }
 }
@@ -1095,7 +1122,7 @@ mod tests {
             .expect("sample has a concrete method");
         let resolved = dex.method(method.method_idx).expect("resolve method");
         let mut lowerer =
-            Lowerer::new(&dex, method, &code, resolved).expect("initialize lowering state");
+            Lowerer::new(&dex, method, &code, resolved, false).expect("initialize lowering state");
         let destination_register = u16::MAX;
 
         lowerer.assign(
@@ -1132,7 +1159,7 @@ mod tests {
         let source_register = code.registers_size - code.ins_size;
         let resolved = dex.method(method.method_idx).expect("resolve method");
         let mut lowerer =
-            Lowerer::new(&dex, method, &code, resolved).expect("initialize lowering state");
+            Lowerer::new(&dex, method, &code, resolved, false).expect("initialize lowering state");
         let source = lowerer.variable(source_register);
         let source_type = lowerer
             .variables
