@@ -29,6 +29,9 @@ pub struct InspectSummary {
 /// must not assume event ordering by DEX number.
 pub type ProgressCallback = Arc<dyn Fn(ExportProgress) + Send + Sync + 'static>;
 
+/// Thread-safe predicate that returns `true` for class descriptors (e.g. `Lcom/pkg/Cls;`) to export.
+pub type ClassFilter = Arc<dyn Fn(&str) -> bool + Send + Sync + 'static>;
+
 /// Options shared by directory and `RGOUT001` exports.
 ///
 /// The default output includes DEX metadata annotations and runs sequentially.
@@ -39,6 +42,7 @@ pub struct ExportOptions {
     pub include_metadata: bool,
     pub debug: bool,
     pub progress_callback: Option<ProgressCallback>,
+    pub class_filter: Option<ClassFilter>,
 }
 
 impl Default for ExportOptions {
@@ -48,6 +52,7 @@ impl Default for ExportOptions {
             include_metadata: true,
             debug: false,
             progress_callback: None,
+            class_filter: None,
         }
     }
 }
@@ -91,6 +96,15 @@ impl ExportOptions {
         F: Fn(ExportProgress) + Send + Sync + 'static,
     {
         self.progress_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// Filters exported classes using a thread-safe descriptor predicate.
+    pub fn with_class_filter<F>(mut self, filter: F) -> Self
+    where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        self.class_filter = Some(Arc::new(filter));
         self
     }
 
@@ -371,6 +385,7 @@ fn export_dex_to_directory(
     thread_count: Option<usize>,
     include_metadata: bool,
     debug: bool,
+    class_filter: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
 ) -> crate::Result<usize> {
     let decompiler = Decompiler::parse(dex_bytes)?.with_debug(debug);
     let decompiler = if include_metadata {
@@ -378,9 +393,13 @@ fn export_dex_to_directory(
     } else {
         decompiler.without_metadata()
     };
-    let classes = match thread_count {
-        Some(thread_count) => decompiler.decompile_all_parallel(thread_count)?,
-        None => decompiler.decompile_all()?,
+    let classes = if let Some(filter) = class_filter {
+        decompiler.decompile_selected_parallel(thread_count, filter)?
+    } else {
+        match thread_count {
+            Some(thread_count) => decompiler.decompile_all_parallel(thread_count)?,
+            None => decompiler.decompile_all()?,
+        }
     };
     let count = classes.len();
     for (descriptor, source) in classes {
@@ -489,7 +508,8 @@ struct ReadyDex {
 
 struct ClassJob {
     dex: Arc<ReadyDex>,
-    range: std::ops::Range<usize>,
+    indices: Vec<usize>,
+    start_class: usize,
 }
 
 enum PipelineTask {
@@ -1026,6 +1046,7 @@ fn process_apk_parallel<F>(
     include_metadata: bool,
     debug: bool,
     progress_callback: Option<&(dyn Fn(ExportProgress) + Send + Sync)>,
+    class_filter: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
     emit_chunk: F,
 ) -> crate::Result<(usize, usize)>
 where
@@ -1101,8 +1122,20 @@ where
                                         decompiler.without_metadata()
                                     };
                                     let decompiler = Arc::new(decompiler);
-                                    let classes = decompiler.dex().classes().len();
-                                    let chunks = classes.div_ceil(APK_CLASS_CHUNK_SIZE);
+                                    let all_classes = decompiler.dex().classes();
+                                    let selected_indices: Vec<usize> = if let Some(filter) = class_filter {
+                                        let mut indices = Vec::new();
+                                        for (idx, class) in all_classes.iter().enumerate() {
+                                            let descriptor = decompiler.dex().class_descriptor(class)?;
+                                            if filter(descriptor) {
+                                                indices.push(idx);
+                                            }
+                                        }
+                                        indices
+                                    } else {
+                                        (0..all_classes.len()).collect()
+                                    };
+                                    let chunks = selected_indices.len().div_ceil(APK_CLASS_CHUNK_SIZE);
                                     if chunks == 0 {
                                         return Ok(false);
                                     }
@@ -1118,15 +1151,14 @@ where
                                             reported_complete: false,
                                         }),
                                     });
-                                    for start in (0..classes).step_by(APK_CLASS_CHUNK_SIZE) {
+                                    for chunk in selected_indices.chunks(APK_CLASS_CHUNK_SIZE) {
                                         pipeline_push(
                                             &tasks,
                                             PipelineTask::Decompile(
                                                 ClassJob {
                                                     dex: Arc::clone(&dex),
-                                                    range: start
-                                                        ..(start + APK_CLASS_CHUNK_SIZE)
-                                                            .min(classes),
+                                                    indices: chunk.to_vec(),
+                                                    start_class: chunk[0],
                                                 },
                                                 false,
                                             ),
@@ -1190,11 +1222,11 @@ where
                             }
                             report_pipeline_activity(progress_callback, &workers, total_dex_files);
                             let dex = job.dex;
-                            let range = job.range;
-                            let start_class = range.start;
-                            let mut records = Vec::with_capacity(range.len());
-                            let result = dex.decompiler.decompile_class_range_for_export(
-                                range,
+                            let indices = job.indices;
+                            let start_class = job.start_class;
+                            let mut records = Vec::with_capacity(indices.len());
+                            let result = dex.decompiler.decompile_class_indices_for_export(
+                                &indices,
                                 |descriptor, output| {
                                     records.push((descriptor.to_owned(), output.source));
                                     Ok(())
@@ -1267,6 +1299,7 @@ fn export_apk_parallel_to_directory(
     include_metadata: bool,
     debug: bool,
     progress_callback: Option<&(dyn Fn(ExportProgress) + Send + Sync)>,
+    class_filter: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
 ) -> crate::Result<(usize, usize)> {
     process_apk_parallel(
         input,
@@ -1274,6 +1307,7 @@ fn export_apk_parallel_to_directory(
         include_metadata,
         debug,
         progress_callback,
+        class_filter,
         |_, _, records| {
             for (descriptor, source) in records {
                 write_java_class(output_directory, &descriptor, &source)?;
@@ -1315,6 +1349,7 @@ fn decompile_dex_binary(
     thread_count: usize,
     include_metadata: bool,
     debug: bool,
+    class_filter: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
 ) -> crate::Result<BinaryDexOutput> {
     let decompiler = Decompiler::parse(dex_bytes)?.with_debug(debug);
     let decompiler = if include_metadata {
@@ -1323,7 +1358,9 @@ fn decompile_dex_binary(
         decompiler.without_metadata()
     };
     let mut payload = Vec::new();
-    let classes = if thread_count > 1 {
+    let classes = if let Some(filter) = class_filter {
+        decompiler.decompile_selected_parallel(Some(thread_count), filter)?
+    } else if thread_count > 1 {
         decompiler.decompile_all_parallel(thread_count)?
     } else {
         decompiler.decompile_all()?
@@ -1396,6 +1433,7 @@ pub fn export_to_directory(
             options.include_metadata,
             options.debug,
             options.progress_callback.as_deref(),
+            options.class_filter.as_deref(),
         )?
     } else {
         let bytes = std::fs::read(input)?;
@@ -1407,6 +1445,7 @@ pub fn export_to_directory(
                 thread_count,
                 options.include_metadata,
                 options.debug,
+                options.class_filter.as_deref(),
             )?,
         )
     };
@@ -1446,6 +1485,7 @@ pub fn export_to_writer(
             options.include_metadata,
             options.debug,
             options.progress_callback.as_deref(),
+            options.class_filter.as_deref(),
             |dex_number, start_class, chunk| {
                 records
                     .lock()
@@ -1465,6 +1505,7 @@ pub fn export_to_writer(
             thread_count.unwrap_or(1),
             options.include_metadata,
             options.debug,
+            options.class_filter.as_deref(),
         )?;
         (1, dex.class_count as usize, None, Some(dex.payload))
     };

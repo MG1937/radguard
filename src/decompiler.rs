@@ -29,7 +29,7 @@ impl<'a> Decompiler<'a> {
         })
     }
 
-    pub(crate) fn parse_owned(dex_bytes: std::sync::Arc<[u8]>) -> Result<Decompiler<'static>> {
+    pub fn parse_owned(dex_bytes: std::sync::Arc<[u8]>) -> Result<Decompiler<'static>> {
         Ok(Decompiler {
             dex: DexFile::parse_owned(dex_bytes)?,
             include_metadata: true,
@@ -75,25 +75,82 @@ impl<'a> Decompiler<'a> {
     /// Decompile one scheduler-owned class range. APK pipeline workers use this
     /// primitive so every DEX shares one global class-worker pool rather than
     /// creating nested pools per DEX.
-    pub(crate) fn decompile_class_range_for_export<F>(
+    pub(crate) fn decompile_class_indices_for_export<F>(
         &self,
-        range: std::ops::Range<usize>,
+        indices: &[usize],
         mut visit: F,
     ) -> Result<usize>
     where
         F: FnMut(&str, SourceOutput) -> Result<()>,
     {
-        let classes = self
-            .dex
-            .classes()
-            .get(range.clone())
-            .ok_or_else(|| Error::data(0, "APK class job has an invalid class range"))?;
-        for class in classes {
+        let all_classes = self.dex.classes();
+        for &index in indices {
+            let class = all_classes
+                .get(index)
+                .ok_or_else(|| Error::data(0, "APK class job has an invalid class index"))?;
             let descriptor = self.dex.class_descriptor(class)?;
             let output = self.write_class(class)?;
             visit(descriptor, output)?;
         }
-        Ok(range.len())
+        Ok(indices.len())
+    }
+
+    pub fn decompile_selected_parallel<P>(
+        &self,
+        thread_count: Option<usize>,
+        predicate: P,
+    ) -> Result<Vec<(String, SourceOutput)>>
+    where
+        P: Fn(&str) -> bool + Sync,
+    {
+        let classes = self.dex.classes();
+        let mut selected = Vec::new();
+        for (idx, class) in classes.iter().enumerate() {
+            let descriptor = self.dex.class_descriptor(class)?;
+            if predicate(descriptor) {
+                selected.push(idx);
+            }
+        }
+        let thread_count = thread_count.unwrap_or(1);
+        if thread_count <= 1 || selected.len() <= 1 {
+            return selected
+                .into_iter()
+                .map(|idx| {
+                    let class = &classes[idx];
+                    Ok((
+                        self.dex.class_descriptor(class)?.to_owned(),
+                        self.write_class(class)?,
+                    ))
+                })
+                .collect();
+        }
+        let worker_count = thread_count.min(selected.len());
+        let chunk_size = selected.len().div_ceil(worker_count);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for chunk in selected.chunks(chunk_size) {
+                handles.push(scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&idx| {
+                            let class = &classes[idx];
+                            Ok((
+                                self.dex.class_descriptor(class)?.to_owned(),
+                                self.write_class(class)?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                }));
+            }
+            let mut output = Vec::with_capacity(selected.len());
+            for handle in handles {
+                let chunk = handle
+                    .join()
+                    .map_err(|_| Error::data(0, "parallel decompiler worker panicked"))??;
+                output.extend(chunk);
+            }
+            Ok(output)
+        })
     }
 
     pub fn decompile_all_parallel(
