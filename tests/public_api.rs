@@ -190,4 +190,18 @@ fn decompiler_recovers_jadx_aligned_literals_comparisons_and_constructors() {
         "expected unsigned shift >>> in:\n{}",
         scene.source
     );
+
+    let sample_bytes = fs::read("tests/fixtures/sample.dex").expect("read sample.dex");
+    let sample_dec = radguard::Decompiler::parse(&sample_bytes).expect("parse sample.dex");
+    let array_queue = sample_dec
+        .decompile_class("Lkotlinx/coroutines/internal/ArrayQueue;")
+        .expect("decompile ArrayQueue")
+        .expect("ArrayQueue exists");
+    assert!(
+        array_queue.source.contains("public class ArrayQueue<T> {")
+            && array_queue.source.contains("public final void addLast(T p3_element)")
+            && array_queue.source.contains("boolean v0_1 = this.head == this.tail;"),
+        "expected generic class signature, debug parameter name p3_element, and simplified boolean equality in:\n{}",
+        array_queue.source
+    );
 }

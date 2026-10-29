@@ -960,7 +960,7 @@ fn infer_definition_group_type<const ENHANCED: bool>(
     locations: &LocationIndex,
     definitions: &[Definition],
 ) -> Option<Cow<'static, str>> {
-    let mut inferred = None;
+    let mut inferred: Option<(Cow<'static, str>, bool)> = None;
     for definition in definitions {
         let Definition::Instruction(location) = definition else {
             continue;
@@ -968,45 +968,72 @@ fn infer_definition_group_type<const ENHANCED: bool>(
         let statement_location = locations.get(*location);
         let statement =
             &graph.nodes[statement_location.node].statements[statement_location.index];
-        let ty = match statement {
+        let Some((ty, is_zero_int)) = (match statement {
             Statement::Assign { rhs, .. } => {
-                if let Value::Invoke(invoke) = rhs
+                let is_zero = matches!(
+                    rhs,
+                    Value::Constant(Constant {
+                        value: ConstantValue::Integer { value: 0, ty: "I" },
+                    })
+                );
+                let t = if let Value::Invoke(invoke) = rhs
                     && invoke.method.name == "<init>"
                     && invoke.method.return_type == "V"
                 {
                     value_type(&invoke.base, graph)
                 } else {
-                    value_type(rhs, graph)
+                    value_type_for_split::<ENHANCED>(rhs, graph)
+                };
+                if is_zero && ENHANCED {
+                    None
+                } else {
+                    t.map(|t| (t, is_zero))
                 }
             }
-            Statement::MoveException { ty, .. } => ty.as_deref().map(str::to_owned).map(Cow::Owned),
+            Statement::MoveException { ty, .. } => ty
+                .as_deref()
+                .map(str::to_owned)
+                .map(Cow::Owned)
+                .map(|t| (t, false)),
             _ => None,
-        };
-        let Some(ty) = ty else {
+        }) else {
             continue;
         };
-        if let Some(existing) = inferred.as_deref() {
-            if existing == ty.as_ref() {
+        if let Some((existing, existing_is_zero)) = inferred.as_ref() {
+            if existing.as_ref() == ty.as_ref() {
+                inferred = Some((ty, *existing_is_zero && is_zero_int));
                 continue;
             }
             if ENHANCED {
-                if existing == "I"
+                if *existing_is_zero
+                    && existing.as_ref() == "I"
                     && (ty.starts_with('L') || ty.starts_with('[') || ty.as_ref() == "Z")
                 {
-                    inferred = Some(ty);
+                    inferred = Some((ty, false));
                     continue;
                 }
-                if ty.as_ref() == "I"
-                    && (existing.starts_with('L') || existing.starts_with('[') || existing == "Z")
+                if is_zero_int
+                    && ty.as_ref() == "I"
+                    && (existing.starts_with('L') || existing.starts_with('[') || existing.as_ref() == "Z")
                 {
                     continue;
                 }
             }
             return None;
         }
-        inferred = Some(ty);
+        inferred = Some((ty, is_zero_int));
     }
-    inferred
+    inferred.map(|(ty, _)| ty)
+}
+
+fn value_type_for_split<const ENHANCED: bool>(
+    value: &Value,
+    graph: &Graph,
+) -> Option<Cow<'static, str>> {
+    match value {
+        Value::Variable(variable) if ENHANCED && !graph.variables.is_declared(*variable) => None,
+        _ => value_type(value, graph),
+    }
 }
 
 fn value_type(value: &Value, graph: &Graph) -> Option<Cow<'static, str>> {
@@ -2173,10 +2200,49 @@ fn recover_types_and_constants(graph: &mut Graph, return_type: &str) {
                                 || (current_ty == Some("Ljava/lang/Object;")
                                     && (inferred.starts_with('L') || inferred.starts_with('['))
                                     && inferred.as_ref() != "Ljava/lang/Object;"))
-                            && let Some(var) = graph.variables.get_mut(lhs)
                         {
-                            var.ty = Some(inferred);
-                            changed = true;
+                            let has_conflicting_non_zero_int = (inferred.starts_with('L')
+                                || inferred.starts_with('[')
+                                || inferred.as_ref() == "Z")
+                                && graph.rpo.iter().any(|&nid| {
+                                    graph.nodes[nid].statements.iter().any(|stmt| {
+                                        if let Statement::Assign {
+                                            lhs: Some(other_lhs),
+                                            rhs: other_rhs,
+                                            ..
+                                        } = stmt
+                                            && *other_lhs == lhs
+                                        {
+                                            if matches!(
+                                                other_rhs,
+                                                Value::Constant(Constant {
+                                                    value: ConstantValue::Integer { value: 0, ty: "I" },
+                                                })
+                                            ) {
+                                                return false;
+                                            }
+                                            if inferred.as_ref() == "Z"
+                                                && matches!(
+                                                    other_rhs,
+                                                    Value::Constant(Constant {
+                                                        value: ConstantValue::Integer { value: 1, ty: "I" },
+                                                    })
+                                                )
+                                            {
+                                                return false;
+                                            }
+                                            value_type(other_rhs, graph).as_deref() == Some("I")
+                                        } else {
+                                            false
+                                        }
+                                    })
+                                });
+                            if !has_conflicting_non_zero_int
+                                && let Some(var) = graph.variables.get_mut(lhs)
+                            {
+                                var.ty = Some(inferred);
+                                changed = true;
+                            }
                         }
                     }
                     Statement::FillArray {
@@ -2245,6 +2311,26 @@ fn recover_types_and_constants(graph: &mut Graph, return_type: &str) {
                 graph.nodes[node].statements[index] = statement;
             }
         }
+        for &node in &graph.rpo {
+            for index in 0..graph.nodes[node].statements.len() {
+                if let Statement::Assign {
+                    lhs: Some(lhs),
+                    rhs,
+                    ..
+                } = &graph.nodes[node].statements[index]
+                {
+                    let lhs = *lhs;
+                    if !graph.variables.is_declared(lhs)
+                        && graph.variables.get(lhs).and_then(|v| v.ty.as_deref()).is_none()
+                        && let Some(inferred) = value_type(rhs, graph)
+                        && !matches!(inferred.as_ref(), "V" | "U" | "W" | "O" | "unknownType")
+                        && let Some(var) = graph.variables.get_mut(lhs)
+                    {
+                        var.ty = Some(inferred);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2282,10 +2368,11 @@ fn propagate_statement_expected_types(
         Statement::Return(Some(value)) => {
             propagate_value_expected_type(value, Some(return_type), graph);
         }
-        Statement::MonitorEnter(value)
-        | Statement::MonitorExit(value)
-        | Statement::Throw(value) => {
-            propagate_value_expected_type(value, None, graph);
+        Statement::MonitorEnter(value) | Statement::MonitorExit(value) => {
+            propagate_value_expected_type(value, Some("Ljava/lang/Object;"), graph);
+        }
+        Statement::Throw(value) => {
+            propagate_value_expected_type(value, Some("Ljava/lang/Throwable;"), graph);
         }
         Statement::Switch { value, .. } => {
             propagate_value_expected_type(value, Some("I"), graph);

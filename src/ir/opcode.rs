@@ -10,7 +10,7 @@ use super::{
     ArrayLoadExpression, ArrayStoreStatement, AssignKind, BinaryExpression, BinaryOp,
     CheckCastExpression, Constant, ConstantValue, FieldReference, FilledArrayExpression,
     InstanceFieldExpression, InstancePutStatement, InvokeExpression, InvokeKind, MethodReference,
-    NewArrayExpression, Statement, UnaryExpression, UnaryOp, Value, VariableTable,
+    NewArrayExpression, Statement, UnaryExpression, UnaryOp, Value, VariableId, VariableTable,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +137,10 @@ fn lower_method_impl(
         }
     }
 
+    if preserve_parameter_types && let Some(entry_stmts) = statements_by_block.first() {
+        apply_kotlin_parameter_names(&mut lowerer.variables, entry_stmts);
+    }
+
     let mut blocks = Vec::with_capacity(analysis.blocks.len());
     for (block_index, block) in analysis.blocks.iter().enumerate() {
         let statements = std::mem::take(&mut statements_by_block[block_index]);
@@ -231,12 +235,23 @@ impl<'a> Lowerer<'a> {
                 .checked_add(1)
                 .ok_or_else(|| Error::data(method.code_off as usize, "register overflow"))?;
         }
-        for parameter_index in resolved.parameter_type_indices {
+        let debug_names = if preserve_parameter_types {
+            dex.debug_parameter_names(code.debug_info_off, resolved.parameter_type_indices.len())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for (idx, parameter_index) in resolved.parameter_type_indices.iter().enumerate() {
             let parameter = dex.type_descriptor(*parameter_index)?;
             let id = variables.register(register);
             variables.set_declared(id, true);
             variables.get_mut(id).expect("inserted register").ty =
                 Some(Cow::Owned(parameter.to_owned()));
+            if let Some(Some(raw_name)) = debug_names.get(idx)
+                && let Some(clean) = sanitize_identifier(raw_name)
+            {
+                variables.set_custom_name(id, format!("{register}_{clean}"));
+            }
             register = register
                 .checked_add(type_width(parameter))
                 .ok_or_else(|| Error::data(method.code_off as usize, "register overflow"))?;
@@ -1100,6 +1115,90 @@ fn invalid_operands(instruction: &DecodedInstruction) -> Error {
         instruction.offset as usize,
         "opcode has an unexpected operand format",
     )
+}
+
+fn sanitize_identifier(raw: &str) -> Option<&str> {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>');
+    if trimmed.is_empty()
+        || trimmed == "this"
+        || trimmed == "super"
+        || trimmed == "null"
+        || trimmed == "true"
+        || trimmed == "false"
+        || trimmed.len() > 40
+    {
+        return None;
+    }
+    let mut chars = trimmed.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() && first != '_' && first != '$' {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+        return None;
+    }
+    Some(trimmed)
+}
+
+fn apply_kotlin_parameter_names(variables: &mut VariableTable, entry_stmts: &[Statement]) {
+    let mut name_regs: std::collections::HashMap<u16, &str> = std::collections::HashMap::new();
+    for stmt in entry_stmts.iter().take(24) {
+        match stmt {
+            Statement::Assign {
+                lhs: Some(VariableId::Register(reg)),
+                rhs:
+                    Value::Constant(Constant {
+                        value: ConstantValue::String(s),
+                    }),
+                ..
+            } => {
+                name_regs.insert(*reg, s.as_str());
+            }
+            Statement::Assign {
+                lhs: None,
+                rhs: Value::Invoke(inv),
+                ..
+            } if inv.kind == InvokeKind::Static
+                && inv.method.return_type == "V"
+                && inv.arguments.len() == 2
+                && inv.method.parameters.len() == 2
+                && inv.method.parameters[1] == "Ljava/lang/String;"
+                && ((inv.method.class == "Lkotlin/jvm/internal/Intrinsics;"
+                    && matches!(
+                        inv.method.name.as_str(),
+                        "checkNotNullParameter" | "checkParameterIsNotNull"
+                    ))
+                    || inv.method.parameters[0] == "Ljava/lang/Object;") =>
+            {
+                let param_id = match &inv.arguments[0] {
+                    Value::Variable(id @ VariableId::Register(_))
+                        if variables.is_declared(*id) && !variables.is_this(*id) =>
+                    {
+                        Some(*id)
+                    }
+                    _ => None,
+                };
+                let raw_name = match &inv.arguments[1] {
+                    Value::Constant(Constant {
+                        value: ConstantValue::String(s),
+                    }) => Some(s.as_str()),
+                    Value::Variable(VariableId::Register(r)) => name_regs.get(r).copied(),
+                    _ => None,
+                };
+                if let (Some(param_id), Some(raw_name)) = (param_id, raw_name)
+                    && let VariableId::Register(reg_num) = param_id
+                    && variables.name(param_id).is_some_and(|n| !n.contains('_'))
+                    && let Some(clean) = sanitize_identifier(raw_name)
+                {
+                    variables.set_custom_name(param_id, format!("{reg_num}_{clean}"));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]

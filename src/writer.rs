@@ -691,8 +691,34 @@ impl<'a> MethodWriter<'a> {
         else {
             return false;
         };
+        let lhs_is_bool = self
+            .graph
+            .variables
+            .get(t_lhs)
+            .and_then(|v| v.ty.as_deref())
+            == Some("Z");
+        let t_bool = match t_rhs {
+            Value::Constant(Constant {
+                value: ConstantValue::Integer { value, ty: "Z" | "I" },
+            }) if lhs_is_bool && (*value == 0 || *value == 1) => Some(*value != 0),
+            _ => None,
+        };
+        let f_bool = match f_rhs {
+            Value::Constant(Constant {
+                value: ConstantValue::Integer { value, ty: "Z" | "I" },
+            }) if lhs_is_bool && (*value == 0 || *value == 1) => Some(*value != 0),
+            _ => None,
+        };
         self.write_indent();
         self.write_variable(t_lhs);
+        if let (Some(tb), Some(fb)) = (t_bool, f_bool)
+            && tb != fb
+        {
+            self.write(" = ");
+            self.write_condition(condition_node, if tb { negate } else { !negate });
+            self.write(";\n");
+            return true;
+        }
         self.write(" = (");
         self.write_condition(condition_node, negate);
         self.write(") ? ");
@@ -1760,14 +1786,13 @@ impl<'a> MethodWriter<'a> {
         }
         if self.graph.variables.is_declared(variable) {
             self.write("p");
-            match variable {
-                VariableId::Register(register) => self.write_u64(u64::from(register)),
-                _ => self.write(
-                    self.graph
-                        .variables
-                        .name(variable)
-                        .expect("registered variable has a name"),
-                ),
+            match self.graph.variables.name(variable) {
+                Some(name) => self.write(name),
+                None => {
+                    if let VariableId::Register(register) = variable {
+                        self.write_u64(u64::from(register));
+                    }
+                }
             }
             return;
         }

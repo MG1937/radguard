@@ -208,6 +208,13 @@ impl<'a> Decompiler<'a> {
             output.source.push_str(";\n");
         }
 
+        let class_signature = if self.include_metadata {
+            let class_anns = self.dex.class_annotations(class)?;
+            self.extract_class_signature(&class_anns)
+        } else {
+            None
+        };
+
         let interface = class.access_flags & 0x200 != 0;
         let access_flags = if interface {
             class.access_flags & !0x400
@@ -222,14 +229,25 @@ impl<'a> Decompiler<'a> {
             output.source.push_str("class ");
         }
         output.source.push_str(&name);
+        if let Some((ref type_params, _, _)) = class_signature
+            && !type_params.is_empty()
+        {
+            output.source.push('<');
+            output.source.push_str(&type_params.join(", "));
+            output.source.push('>');
+        }
 
         if let Some(superclass) = self.dex.class_superclass(class)?
             && superclass != "Ljava/lang/Object;"
         {
             output.source.push_str(" extends ");
-            output
-                .source
-                .push_str(&superclass[1..superclass.len() - 1].replace('/', "."));
+            if let Some((_, Some(ref generic_super), _)) = class_signature {
+                output.source.push_str(generic_super);
+            } else {
+                output
+                    .source
+                    .push_str(&superclass[1..superclass.len() - 1].replace('/', "."));
+            }
         }
         let interfaces = self.dex.class_interfaces(class)?;
         if !interfaces.is_empty() {
@@ -238,15 +256,32 @@ impl<'a> Decompiler<'a> {
                 if index != 0 {
                     output.source.push_str(", ");
                 }
-                output
-                    .source
-                    .push_str(&interface[1..interface.len() - 1].replace('/', "."));
+                if let Some((_, _, ref generic_ifaces)) = class_signature
+                    && generic_ifaces.len() == interfaces.len()
+                    && let Some(generic_iface) = generic_ifaces.get(index)
+                {
+                    output.source.push_str(generic_iface);
+                } else {
+                    output
+                        .source
+                        .push_str(&interface[1..interface.len() - 1].replace('/', "."));
+                }
             }
         }
         output.source.push_str(" {\n");
 
+        let field_annotations = if self.include_metadata {
+            Some(self.dex.field_annotations(class)?)
+        } else {
+            None
+        };
         for field in class.fields() {
-            self.write_field(&mut output, field)?;
+            let annotations = field_annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(&field.field_idx))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            self.write_field(&mut output, field, annotations)?;
         }
         let method_annotations = if self.include_metadata {
             Some(self.dex.method_annotations(class)?)
@@ -265,7 +300,12 @@ impl<'a> Decompiler<'a> {
         Ok(output)
     }
 
-    fn write_field(&self, output: &mut SourceOutput, field: &EncodedField) -> Result<()> {
+    fn write_field(
+        &self,
+        output: &mut SourceOutput,
+        field: &EncodedField,
+        annotations: &[EncodedAnnotation],
+    ) -> Result<()> {
         let resolved = self.dex.field(field.field_idx)?;
         output.source.push_str("    ");
         let access = field_access(field.access_flags);
@@ -273,7 +313,17 @@ impl<'a> Decompiler<'a> {
             output.source.push_str(&access.join(" "));
             output.source.push(' ');
         }
-        output.source.push_str(&descriptor_to_java(resolved.ty));
+        if let Some(generic_ty) = self
+            .include_metadata
+            .then(|| self.extract_field_signature(annotations))
+            .flatten()
+        {
+            output.source.push_str(&generic_ty);
+        } else if self.include_metadata {
+            output.source.push_str(&descriptor_to_java_enhanced(resolved.ty));
+        } else {
+            output.source.push_str(&descriptor_to_java(resolved.ty));
+        }
         output.source.push(' ');
         let start = output.source.len();
         output.source.push_str(resolved.name);
@@ -592,11 +642,7 @@ impl<'a> Decompiler<'a> {
         })
     }
 
-    fn extract_method_signature(
-        &self,
-        annotations: &[EncodedAnnotation],
-        expected_params: usize,
-    ) -> Option<(Vec<String>, String)> {
+    fn extract_signature_string(&self, annotations: &[EncodedAnnotation]) -> Option<String> {
         for annotation in annotations {
             let ty = self.dex.type_descriptor(annotation.type_idx).ok()?;
             if ty != "Ldalvik/annotation/Signature;" {
@@ -616,15 +662,92 @@ impl<'a> Decompiler<'a> {
                     };
                     combined.push_str(self.dex.string(*idx).ok()?);
                 }
-                if let Some((params, ret)) = parse_dalvik_method_signature(&combined)
-                    && params.len() == expected_params
-                {
-                    return Some((params, ret));
-                }
+                return Some(combined);
             }
         }
         None
     }
+
+    fn extract_method_signature(
+        &self,
+        annotations: &[EncodedAnnotation],
+        expected_params: usize,
+    ) -> Option<(Vec<String>, String)> {
+        let combined = self.extract_signature_string(annotations)?;
+        let (params, ret) = parse_dalvik_method_signature(&combined)?;
+        (params.len() == expected_params).then_some((params, ret))
+    }
+
+    fn extract_field_signature(&self, annotations: &[EncodedAnnotation]) -> Option<String> {
+        let combined = self.extract_signature_string(annotations)?;
+        let mut chars = combined.chars().peekable();
+        parse_signature_type(&mut chars)
+    }
+
+    fn extract_class_signature(
+        &self,
+        annotations: &[EncodedAnnotation],
+    ) -> Option<(Vec<String>, Option<String>, Vec<String>)> {
+        let combined = self.extract_signature_string(annotations)?;
+        parse_dalvik_class_signature(&combined)
+    }
+}
+
+fn parse_type_parameters(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<Vec<String>> {
+    if chars.peek() != Some(&'<') {
+        return Some(Vec::new());
+    }
+    chars.next();
+    let mut params = Vec::new();
+    while chars.peek().is_some_and(|&c| c != '>') {
+        let mut ident = String::new();
+        while let Some(&c) = chars.peek() {
+            if c == ':' || c == '>' {
+                break;
+            }
+            ident.push(c);
+            chars.next();
+        }
+        if ident.is_empty() {
+            return None;
+        }
+        let mut bounds = Vec::new();
+        while chars.peek() == Some(&':') {
+            chars.next();
+            if chars.peek() == Some(&':') || chars.peek() == Some(&'>') {
+                continue;
+            }
+            let bound = parse_signature_type(chars)?;
+            if bound != "Object" && bound != "java.lang.Object" {
+                bounds.push(bound);
+            }
+        }
+        if bounds.is_empty() {
+            params.push(ident);
+        } else {
+            params.push(format!("{ident} extends {}", bounds.join(" & ")));
+        }
+    }
+    if chars.next() != Some('>') {
+        return None;
+    }
+    Some(params)
+}
+
+fn parse_dalvik_class_signature(
+    sig: &str,
+) -> Option<(Vec<String>, Option<String>, Vec<String>)> {
+    let mut chars = sig.chars().peekable();
+    let type_params = parse_type_parameters(&mut chars)?;
+    let super_ty = parse_signature_type(&mut chars)?;
+    let super_ty = (super_ty != "Object" && super_ty != "java.lang.Object").then_some(super_ty);
+    let mut interfaces = Vec::new();
+    while chars.peek().is_some() {
+        interfaces.push(parse_signature_type(&mut chars)?);
+    }
+    Some((type_params, super_ty, interfaces))
 }
 
 fn parse_dalvik_method_signature(sig: &str) -> Option<(Vec<String>, String)> {

@@ -450,6 +450,70 @@ impl<'a> DexFile<'a> {
         parse_code_item(self.data.as_slice(), method.code_off)
     }
 
+    pub fn debug_parameter_names(
+        &self,
+        debug_info_off: u32,
+        param_count: usize,
+    ) -> Result<Vec<Option<&str>>> {
+        if debug_info_off == 0 || param_count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut cursor = Cursor::at(self.data.as_slice(), debug_info_off as usize)?;
+        let _line_start = cursor.uleb128()?;
+        let parameters_size = cursor.uleb128()? as usize;
+        let count = parameters_size.min(param_count);
+        let mut names = Vec::with_capacity(count);
+        for _ in 0..count {
+            let idx_plus_one = cursor.uleb128()?;
+            if idx_plus_one == 0 {
+                names.push(None);
+            } else {
+                let idx = idx_plus_one - 1;
+                names.push(self.string(idx).ok().filter(|s| !s.is_empty()));
+            }
+        }
+        Ok(names)
+    }
+
+    pub fn class_annotations(&self, class: &ClassDef) -> Result<Vec<EncodedAnnotation>> {
+        if class.annotations_off == 0 {
+            return Ok(Vec::new());
+        }
+        let directory = class.annotations_off as usize;
+        let class_annotations_off = read_u32(self.data.as_slice(), directory)?;
+        parse_annotation_set(self.data.as_slice(), class_annotations_off)
+    }
+
+    pub fn field_annotations(
+        &self,
+        class: &ClassDef,
+    ) -> Result<HashMap<u32, Vec<EncodedAnnotation>>> {
+        let mut annotations = HashMap::new();
+        if class.annotations_off == 0 {
+            return Ok(annotations);
+        }
+        let directory = class.annotations_off as usize;
+        let fields_size = read_u32(self.data.as_slice(), directory + 4)? as usize;
+        let field_bytes = fields_size
+            .checked_mul(8)
+            .ok_or_else(|| Error::data(directory, "field annotation table size overflow"))?;
+        let field_start = directory
+            .checked_add(16)
+            .ok_or_else(|| Error::data(directory, "annotation directory offset overflow"))?;
+        require_range(self.data.as_slice(), field_start, field_bytes)?;
+        for index in 0..fields_size {
+            let entry = field_start + index * 8;
+            let field_idx = read_u32(self.data.as_slice(), entry)?;
+            check_index("field", field_idx, self.fields.len())?;
+            let set_off = read_u32(self.data.as_slice(), entry + 4)?;
+            annotations.insert(
+                field_idx,
+                parse_annotation_set(self.data.as_slice(), set_off)?,
+            );
+        }
+        Ok(annotations)
+    }
+
     pub fn method_annotations(
         &self,
         class: &ClassDef,
