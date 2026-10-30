@@ -8,6 +8,7 @@
 *.py
 !/tests/quality_gate.py
 !/tests/test_quality_gate.py
+!/tests/regenerate_catch_annotations.py
 *.py[cod]
 __pycache__/
 .pytest_cache/

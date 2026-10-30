@@ -494,9 +494,12 @@ impl<'a> MethodWriter<'a> {
                 .variables
                 .get(*lhs)
                 .and_then(|variable| variable.ty.as_deref());
-            let ty = variable_type
+            let ty = catch
+                .catch_types
+                .first()
+                .map(String::as_str)
                 .or(ty.as_deref())
-                .or_else(|| catch.catch_types.first().map(String::as_str))
+                .or(variable_type)
                 .unwrap_or("Ljava/lang/Throwable;");
             self.write(&descriptor_to_java(ty));
             self.write(" ");
