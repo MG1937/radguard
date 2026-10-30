@@ -25,6 +25,10 @@ $DiffWorkers = if ($env:RADGUARD_DIFF_WORKERS) {
     [Environment]::ProcessorCount
 }
 
+Write-Host "==> Quality comparator regression tests"
+python -S -m unittest discover -s tests -p test_quality_gate.py
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 Write-Host "==> Frozen DAD quality gates (Phase 1 = 0, Phase 2 <= 70; $DiffWorkers diff workers)"
 python -S tests/quality_gate.py --phase 2 --diff-workers $DiffWorkers --no-build --rust-bin $RustBin
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

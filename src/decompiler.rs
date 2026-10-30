@@ -303,10 +303,10 @@ impl<'a> Decompiler<'a> {
             })
             .unwrap_or_default();
         output.source.push('(');
-        for (index, (parameter_type_index, parameter)) in resolved
+        // Methods without code still have prototype parameters, but no registers.
+        for (index, parameter_type_index) in resolved
             .parameter_type_indices
             .iter()
-            .zip(parameter_registers.iter())
             .enumerate()
         {
             let parameter_type = self.dex.type_descriptor(*parameter_type_index)?;
@@ -318,11 +318,16 @@ impl<'a> Decompiler<'a> {
                 .push_str(&descriptor_to_java(parameter_type));
             output.source.push(' ');
             output.source.push('p');
-            let name = graph
-                .as_ref()
-                .and_then(|graph| graph.variables.name(*parameter))
-                .unwrap_or("unknown");
-            output.source.push_str(name);
+            let name = parameter_registers.get(index).and_then(|parameter| {
+                graph
+                    .as_ref()
+                    .and_then(|graph| graph.variables.name(*parameter))
+            });
+            if let Some(name) = name {
+                output.source.push_str(name);
+            } else {
+                output.source.push_str(&index.to_string());
+            }
         }
         output.source.push(')');
 
