@@ -88,7 +88,8 @@ impl VariableMetadata {
     fn versioned(base: &Self, version: usize) -> Self {
         let mut digits = [0_u8; 20];
         let digits = write_decimal(version as u64, &mut digits);
-        let base = base.as_str();
+        let raw_base = base.as_str();
+        let base = raw_base.split_once('_').map_or(raw_base, |(prefix, _)| prefix);
         let len = base.len() + 1 + digits.len();
         if len <= INLINE_VARIABLE_NAME_CAPACITY {
             let mut storage = [0; INLINE_VARIABLE_NAME_CAPACITY + 1];
@@ -913,6 +914,18 @@ impl VariableTable {
         let mut metadata = VariableMetadata::versioned(base_metadata, version);
         metadata.set_flags(flags);
         *self.metadata_mut(id).expect("known variable metadata") = metadata;
+    }
+
+    pub(crate) fn set_custom_name(&mut self, id: VariableId, custom_name: String) {
+        let flags = self
+            .metadata(id)
+            .expect("known variable metadata")
+            .flags();
+        *self.metadata_mut(id).expect("known variable metadata") =
+            VariableMetadata::Owned(Box::new(OwnedVariableMetadata {
+                flags,
+                name: custom_name.into_boxed_str(),
+            }));
     }
 
     pub fn is_declared(&self, id: VariableId) -> bool {

@@ -4,8 +4,16 @@ pub const ACCESS_ORDER: [u32; 17] = [
 ];
 
 pub fn descriptor_to_java(descriptor: &str) -> String {
+    descriptor_to_java_mode(descriptor, false)
+}
+
+pub fn descriptor_to_java_enhanced(descriptor: &str) -> String {
+    descriptor_to_java_mode(descriptor, true)
+}
+
+fn descriptor_to_java_mode(descriptor: &str, enhanced: bool) -> String {
     if let Some(element) = descriptor.strip_prefix('[') {
-        return format!("{}[]", descriptor_to_java(element));
+        return format!("{}[]", descriptor_to_java_mode(element, enhanced));
     }
     match descriptor {
         "V" => "void".to_owned(),
@@ -20,10 +28,20 @@ pub fn descriptor_to_java(descriptor: &str) -> String {
         "O" => "Object".to_owned(),
         _ if descriptor.starts_with('L') && descriptor.ends_with(';') => {
             let class = descriptor[1..descriptor.len() - 1].replace('/', ".");
-            class
-                .strip_prefix("java.lang.")
-                .unwrap_or(&class)
-                .to_owned()
+            if enhanced {
+                if let Some(rest) = class.strip_prefix("java.lang.")
+                    && !rest.contains('.')
+                {
+                    rest.to_owned()
+                } else {
+                    class
+                }
+            } else {
+                class
+                    .strip_prefix("java.lang.")
+                    .unwrap_or(&class)
+                    .to_owned()
+            }
         }
         _ => descriptor.to_owned(),
     }

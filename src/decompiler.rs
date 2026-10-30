@@ -6,8 +6,13 @@ use crate::dex::{
 use crate::error::{Error, Result};
 use crate::graph::Graph;
 use crate::ir::opcode::lower_method_with_resolved;
-use crate::types::{class_access, descriptor_to_java, field_access, method_access};
-use crate::writer::{escape_java_string, MemberKind, MemberReference, MethodWriter, SourceOutput};
+use crate::types::{
+    class_access, descriptor_to_java, descriptor_to_java_enhanced, field_access, method_access,
+};
+use crate::writer::{
+    escape_java_string, format_java_char, format_java_f32, format_java_f64, MemberKind,
+    MemberReference, MethodWriter, SourceOutput,
+};
 
 pub struct Decompiler<'a> {
     dex: DexFile<'a>,
@@ -24,7 +29,7 @@ impl<'a> Decompiler<'a> {
         })
     }
 
-    pub(crate) fn parse_owned(dex_bytes: std::sync::Arc<[u8]>) -> Result<Decompiler<'static>> {
+    pub fn parse_owned(dex_bytes: std::sync::Arc<[u8]>) -> Result<Decompiler<'static>> {
         Ok(Decompiler {
             dex: DexFile::parse_owned(dex_bytes)?,
             include_metadata: true,
@@ -70,25 +75,82 @@ impl<'a> Decompiler<'a> {
     /// Decompile one scheduler-owned class range. APK pipeline workers use this
     /// primitive so every DEX shares one global class-worker pool rather than
     /// creating nested pools per DEX.
-    pub(crate) fn decompile_class_range_for_export<F>(
+    pub(crate) fn decompile_class_indices_for_export<F>(
         &self,
-        range: std::ops::Range<usize>,
+        indices: &[usize],
         mut visit: F,
     ) -> Result<usize>
     where
         F: FnMut(&str, SourceOutput) -> Result<()>,
     {
-        let classes = self
-            .dex
-            .classes()
-            .get(range.clone())
-            .ok_or_else(|| Error::data(0, "APK class job has an invalid class range"))?;
-        for class in classes {
+        let all_classes = self.dex.classes();
+        for &index in indices {
+            let class = all_classes
+                .get(index)
+                .ok_or_else(|| Error::data(0, "APK class job has an invalid class index"))?;
             let descriptor = self.dex.class_descriptor(class)?;
             let output = self.write_class(class)?;
             visit(descriptor, output)?;
         }
-        Ok(range.len())
+        Ok(indices.len())
+    }
+
+    pub fn decompile_selected_parallel<P>(
+        &self,
+        thread_count: Option<usize>,
+        predicate: P,
+    ) -> Result<Vec<(String, SourceOutput)>>
+    where
+        P: Fn(&str) -> bool + Sync,
+    {
+        let classes = self.dex.classes();
+        let mut selected = Vec::new();
+        for (idx, class) in classes.iter().enumerate() {
+            let descriptor = self.dex.class_descriptor(class)?;
+            if predicate(descriptor) {
+                selected.push(idx);
+            }
+        }
+        let thread_count = thread_count.unwrap_or(1);
+        if thread_count <= 1 || selected.len() <= 1 {
+            return selected
+                .into_iter()
+                .map(|idx| {
+                    let class = &classes[idx];
+                    Ok((
+                        self.dex.class_descriptor(class)?.to_owned(),
+                        self.write_class(class)?,
+                    ))
+                })
+                .collect();
+        }
+        let worker_count = thread_count.min(selected.len());
+        let chunk_size = selected.len().div_ceil(worker_count);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for chunk in selected.chunks(chunk_size) {
+                handles.push(scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&idx| {
+                            let class = &classes[idx];
+                            Ok((
+                                self.dex.class_descriptor(class)?.to_owned(),
+                                self.write_class(class)?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                }));
+            }
+            let mut output = Vec::with_capacity(selected.len());
+            for handle in handles {
+                let chunk = handle
+                    .join()
+                    .map_err(|_| Error::data(0, "parallel decompiler worker panicked"))??;
+                output.extend(chunk);
+            }
+            Ok(output)
+        })
     }
 
     pub fn decompile_all_parallel(
@@ -146,6 +208,13 @@ impl<'a> Decompiler<'a> {
             output.source.push_str(";\n");
         }
 
+        let class_signature = if self.include_metadata {
+            let class_anns = self.dex.class_annotations(class)?;
+            self.extract_class_signature(&class_anns)
+        } else {
+            None
+        };
+
         let interface = class.access_flags & 0x200 != 0;
         let access_flags = if interface {
             class.access_flags & !0x400
@@ -160,14 +229,25 @@ impl<'a> Decompiler<'a> {
             output.source.push_str("class ");
         }
         output.source.push_str(&name);
+        if let Some((ref type_params, _, _)) = class_signature
+            && !type_params.is_empty()
+        {
+            output.source.push('<');
+            output.source.push_str(&type_params.join(", "));
+            output.source.push('>');
+        }
 
         if let Some(superclass) = self.dex.class_superclass(class)?
             && superclass != "Ljava/lang/Object;"
         {
             output.source.push_str(" extends ");
-            output
-                .source
-                .push_str(&superclass[1..superclass.len() - 1].replace('/', "."));
+            if let Some((_, Some(ref generic_super), _)) = class_signature {
+                output.source.push_str(generic_super);
+            } else {
+                output
+                    .source
+                    .push_str(&superclass[1..superclass.len() - 1].replace('/', "."));
+            }
         }
         let interfaces = self.dex.class_interfaces(class)?;
         if !interfaces.is_empty() {
@@ -176,15 +256,43 @@ impl<'a> Decompiler<'a> {
                 if index != 0 {
                     output.source.push_str(", ");
                 }
-                output
-                    .source
-                    .push_str(&interface[1..interface.len() - 1].replace('/', "."));
+                if let Some((_, _, ref generic_ifaces)) = class_signature
+                    && generic_ifaces.len() == interfaces.len()
+                    && let Some(generic_iface) = generic_ifaces.get(index)
+                {
+                    output.source.push_str(generic_iface);
+                } else {
+                    output
+                        .source
+                        .push_str(&interface[1..interface.len() - 1].replace('/', "."));
+                }
             }
         }
         output.source.push_str(" {\n");
 
+        let mut synthetic_members = std::collections::HashSet::new();
+        let field_annotations = if self.include_metadata {
+            Some(self.dex.field_annotations(class)?)
+        } else {
+            None
+        };
         for field in class.fields() {
-            self.write_field(&mut output, field)?;
+            if field.access_flags & 0x1000 != 0
+                && let Ok(resolved) = self.dex.field(field.field_idx)
+            {
+                synthetic_members.insert((
+                    MemberKind::Field,
+                    resolved.class.to_owned(),
+                    resolved.name.to_owned(),
+                    resolved.ty.to_owned(),
+                ));
+            }
+            let annotations = field_annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(&field.field_idx))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            self.write_field(&mut output, field, annotations)?;
         }
         let method_annotations = if self.include_metadata {
             Some(self.dex.method_annotations(class)?)
@@ -192,6 +300,16 @@ impl<'a> Decompiler<'a> {
             None
         };
         for method in class.methods() {
+            if (method.access_flags & 0x1040 != 0)
+                && let Ok(resolved) = self.dex.method(method.method_idx)
+            {
+                synthetic_members.insert((
+                    MemberKind::Method,
+                     descriptor.to_owned(),
+                    resolved.name.to_owned(),
+                    resolved.descriptor.to_owned(),
+                ));
+            }
             let annotations = method_annotations
                 .as_ref()
                 .and_then(|annotations| annotations.get(&method.method_idx))
@@ -199,11 +317,30 @@ impl<'a> Decompiler<'a> {
                 .unwrap_or_default();
             output = self.write_method(output, descriptor, &name, method, annotations)?;
         }
+        if !synthetic_members.is_empty() {
+            for r in &mut output.member_references {
+                if !r.synthetic
+                    && synthetic_members.contains(&(
+                        r.kind.clone(),
+                        r.class.clone(),
+                        r.name.clone(),
+                        r.descriptor.clone(),
+                    ))
+                {
+                    r.synthetic = true;
+                }
+            }
+        }
         output.source.push_str("}\n");
         Ok(output)
     }
 
-    fn write_field(&self, output: &mut SourceOutput, field: &EncodedField) -> Result<()> {
+    fn write_field(
+        &self,
+        output: &mut SourceOutput,
+        field: &EncodedField,
+        annotations: &[EncodedAnnotation],
+    ) -> Result<()> {
         let resolved = self.dex.field(field.field_idx)?;
         output.source.push_str("    ");
         let access = field_access(field.access_flags);
@@ -211,7 +348,17 @@ impl<'a> Decompiler<'a> {
             output.source.push_str(&access.join(" "));
             output.source.push(' ');
         }
-        output.source.push_str(&descriptor_to_java(resolved.ty));
+        if let Some(generic_ty) = self
+            .include_metadata
+            .then(|| self.extract_field_signature(annotations))
+            .flatten()
+        {
+            output.source.push_str(&generic_ty);
+        } else if self.include_metadata {
+            output.source.push_str(&descriptor_to_java_enhanced(resolved.ty));
+        } else {
+            output.source.push_str(&descriptor_to_java(resolved.ty));
+        }
         output.source.push(' ');
         let start = output.source.len();
         output.source.push_str(resolved.name);
@@ -223,6 +370,7 @@ impl<'a> Decompiler<'a> {
             name: resolved.name.to_owned(),
             descriptor: resolved.ty.to_owned(),
             declaration: true,
+            synthetic: field.access_flags & 0x1000 != 0,
         });
         if let Some(value) = &field.initial_value {
             output.source.push_str(" = ");
@@ -266,8 +414,17 @@ impl<'a> Decompiler<'a> {
             output.source.push_str(&modifiers.join(" "));
             output.source.push(' ');
         }
+        let generic_signature = if self.include_metadata {
+            self.extract_method_signature(annotations, resolved.parameter_type_indices.len())
+        } else {
+            None
+        };
         if !constructor {
-            output.source.push_str(&descriptor_to_java(return_type));
+            if let Some((_, ref ret_ty)) = generic_signature {
+                output.source.push_str(ret_ty);
+            } else {
+                output.source.push_str(&descriptor_to_java(return_type));
+            }
             output.source.push(' ');
         }
         let displayed_name = if constructor {
@@ -285,9 +442,11 @@ impl<'a> Decompiler<'a> {
             name: resolved.name.to_owned(),
             descriptor: resolved.descriptor.to_owned(),
             declaration: true,
+            synthetic: method.access_flags & 0x1040 != 0,
         });
 
-        let lowered = lower_method_with_resolved(&self.dex, method, resolved)?;
+        let lowered =
+            lower_method_with_resolved(&self.dex, method, resolved, self.include_metadata)?;
         let mut graph = lowered.map(Graph::from_lowered);
         let parameter_registers = graph
             .as_ref()
@@ -313,9 +472,15 @@ impl<'a> Decompiler<'a> {
             if index != 0 {
                 output.source.push_str(", ");
             }
-            output
-                .source
-                .push_str(&descriptor_to_java(parameter_type));
+            if let Some((ref param_types, _)) = generic_signature
+                && let Some(generic_param) = param_types.get(index)
+            {
+                output.source.push_str(generic_param);
+            } else {
+                output
+                    .source
+                    .push_str(&descriptor_to_java(parameter_type));
+            }
             output.source.push(' ');
             output.source.push('p');
             let name = parameter_registers.get(index).and_then(|parameter| {
@@ -338,7 +503,11 @@ impl<'a> Decompiler<'a> {
         if self.debug {
             graph.debug_dump("lowered");
         }
-        dataflow::optimize_for_decompilation(graph);
+        if self.include_metadata {
+            dataflow::optimize_for_decompilation_enhanced(graph, return_type);
+        } else {
+            dataflow::optimize_for_decompilation(graph);
+        }
         graph.split_condition_nodes();
         graph.simplify();
         graph.compute_rpo();
@@ -356,6 +525,7 @@ impl<'a> Decompiler<'a> {
                 constructor,
                 output,
                 self.debug,
+                self.include_metadata,
             )
             .write_body(),
         )
@@ -371,11 +541,37 @@ impl<'a> Decompiler<'a> {
                 }
             }
             EncodedValue::Short(value) => value.to_string(),
-            EncodedValue::Char(value) => value.to_string(),
+            EncodedValue::Char(value) => {
+                if self.include_metadata && field_type == "C" {
+                    format_java_char(*value)
+                } else {
+                    value.to_string()
+                }
+            }
             EncodedValue::Int(value) => value.to_string(),
-            EncodedValue::Long(value) => value.to_string(),
-            EncodedValue::Float(bits) => f32::from_bits(*bits).to_string(),
-            EncodedValue::Double(bits) => f64::from_bits(*bits).to_string(),
+            EncodedValue::Long(value) => {
+                if self.include_metadata {
+                    format!("{value}L")
+                } else {
+                    value.to_string()
+                }
+            }
+            EncodedValue::Float(bits) => {
+                let value = f32::from_bits(*bits);
+                if self.include_metadata {
+                    format_java_f32(value)
+                } else {
+                    value.to_string()
+                }
+            }
+            EncodedValue::Double(bits) => {
+                let value = f64::from_bits(*bits);
+                if self.include_metadata {
+                    format_java_f64(value)
+                } else {
+                    value.to_string()
+                }
+            }
             EncodedValue::String(index) => escape_java_string(self.dex.string(*index)?),
             EncodedValue::Type(index) => {
                 format!("{}.class", descriptor_to_java(self.dex.type_descriptor(*index)?))
@@ -413,10 +609,24 @@ impl<'a> Decompiler<'a> {
                     format!("@{name}({})", elements.join(", "))
                 }
             }
-            EncodedValue::Null if field_type == "Ljava/lang/String;" => "\"\"".to_owned(),
-            EncodedValue::Null => "None".to_owned(),
+            EncodedValue::Null if field_type == "Ljava/lang/String;" && !self.include_metadata => {
+                "\"\"".to_owned()
+            }
+            EncodedValue::Null => {
+                if self.include_metadata {
+                    "null".to_owned()
+                } else {
+                    "None".to_owned()
+                }
+            }
             EncodedValue::Boolean(value) => {
-                if *value {
+                if self.include_metadata {
+                    if *value {
+                        "true".to_owned()
+                    } else {
+                        "false".to_owned()
+                    }
+                } else if *value {
                     "True".to_owned()
                 } else {
                     "False".to_owned()
@@ -467,6 +677,222 @@ impl<'a> Decompiler<'a> {
             EncodedValue::Null => "null".to_owned(),
             _ => self.encoded_value(value, "")?,
         })
+    }
+
+    fn extract_signature_string(&self, annotations: &[EncodedAnnotation]) -> Option<String> {
+        for annotation in annotations {
+            let ty = self.dex.type_descriptor(annotation.type_idx).ok()?;
+            if ty != "Ldalvik/annotation/Signature;" {
+                continue;
+            }
+            for element in &annotation.elements {
+                if self.dex.string(element.name_idx).ok()? != "value" {
+                    continue;
+                }
+                let EncodedValue::Array(values) = &element.value else {
+                    continue;
+                };
+                let mut combined = String::new();
+                for val in values {
+                    let EncodedValue::String(idx) = val else {
+                        return None;
+                    };
+                    combined.push_str(self.dex.string(*idx).ok()?);
+                }
+                return Some(combined);
+            }
+        }
+        None
+    }
+
+    fn extract_method_signature(
+        &self,
+        annotations: &[EncodedAnnotation],
+        expected_params: usize,
+    ) -> Option<(Vec<String>, String)> {
+        let combined = self.extract_signature_string(annotations)?;
+        let (params, ret) = parse_dalvik_method_signature(&combined)?;
+        (params.len() == expected_params).then_some((params, ret))
+    }
+
+    fn extract_field_signature(&self, annotations: &[EncodedAnnotation]) -> Option<String> {
+        let combined = self.extract_signature_string(annotations)?;
+        let mut chars = combined.chars().peekable();
+        parse_signature_type(&mut chars)
+    }
+
+    fn extract_class_signature(
+        &self,
+        annotations: &[EncodedAnnotation],
+    ) -> Option<(Vec<String>, Option<String>, Vec<String>)> {
+        let combined = self.extract_signature_string(annotations)?;
+        parse_dalvik_class_signature(&combined)
+    }
+}
+
+fn parse_type_parameters(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<Vec<String>> {
+    if chars.peek() != Some(&'<') {
+        return Some(Vec::new());
+    }
+    chars.next();
+    let mut params = Vec::new();
+    while chars.peek().is_some_and(|&c| c != '>') {
+        let mut ident = String::new();
+        while let Some(&c) = chars.peek() {
+            if c == ':' || c == '>' {
+                break;
+            }
+            ident.push(c);
+            chars.next();
+        }
+        if ident.is_empty() {
+            return None;
+        }
+        let mut bounds = Vec::new();
+        while chars.peek() == Some(&':') {
+            chars.next();
+            if chars.peek() == Some(&':') || chars.peek() == Some(&'>') {
+                continue;
+            }
+            let bound = parse_signature_type(chars)?;
+            if bound != "Object" && bound != "java.lang.Object" {
+                bounds.push(bound);
+            }
+        }
+        if bounds.is_empty() {
+            params.push(ident);
+        } else {
+            params.push(format!("{ident} extends {}", bounds.join(" & ")));
+        }
+    }
+    if chars.next() != Some('>') {
+        return None;
+    }
+    Some(params)
+}
+
+fn parse_dalvik_class_signature(
+    sig: &str,
+) -> Option<(Vec<String>, Option<String>, Vec<String>)> {
+    let mut chars = sig.chars().peekable();
+    let type_params = parse_type_parameters(&mut chars)?;
+    let super_ty = parse_signature_type(&mut chars)?;
+    let super_ty = (super_ty != "Object" && super_ty != "java.lang.Object").then_some(super_ty);
+    let mut interfaces = Vec::new();
+    while chars.peek().is_some() {
+        interfaces.push(parse_signature_type(&mut chars)?);
+    }
+    Some((type_params, super_ty, interfaces))
+}
+
+fn parse_dalvik_method_signature(sig: &str) -> Option<(Vec<String>, String)> {
+    let mut chars = sig.chars().peekable();
+    if chars.peek() == Some(&'<') {
+        let mut depth = 0;
+        for ch in chars.by_ref() {
+            match ch {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if chars.next() != Some('(') {
+        return None;
+    }
+    let mut params = Vec::new();
+    while chars.peek().is_some_and(|&c| c != ')') {
+        params.push(parse_signature_type(&mut chars)?);
+    }
+    if chars.next() != Some(')') {
+        return None;
+    }
+    let ret = parse_signature_type(&mut chars)?;
+    Some((params, ret))
+}
+
+fn parse_signature_type(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    match chars.next()? {
+        'V' => Some("void".to_owned()),
+        'Z' => Some("boolean".to_owned()),
+        'B' => Some("byte".to_owned()),
+        'S' => Some("short".to_owned()),
+        'C' => Some("char".to_owned()),
+        'I' => Some("int".to_owned()),
+        'J' => Some("long".to_owned()),
+        'F' => Some("float".to_owned()),
+        'D' => Some("double".to_owned()),
+        '[' => {
+            let elem = parse_signature_type(chars)?;
+            Some(format!("{elem}[]"))
+        }
+        'T' => {
+            let mut name = String::new();
+            for ch in chars.by_ref() {
+                if ch == ';' {
+                    return (!name.is_empty()).then_some(name);
+                }
+                name.push(ch);
+            }
+            None
+        }
+        'L' => {
+            let mut raw = String::new();
+            let mut type_args = Vec::new();
+            loop {
+                match chars.next()? {
+                    ';' => break,
+                    '<' => {
+                        while chars.peek().is_some_and(|&c| c != '>') {
+                            type_args.push(parse_signature_type_argument(chars)?);
+                        }
+                        if chars.next() != Some('>') {
+                            return None;
+                        }
+                    }
+                    '.' => {
+                        raw.push('$');
+                    }
+                    ch => raw.push(ch),
+                }
+            }
+            let base = descriptor_to_java_enhanced(&format!("L{raw};"));
+            if type_args.is_empty() {
+                Some(base)
+            } else {
+                Some(format!("{base}<{}>", type_args.join(", ")))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_signature_type_argument(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<String> {
+    match chars.peek()? {
+        '*' => {
+            chars.next();
+            Some("?".to_owned())
+        }
+        '+' => {
+            chars.next();
+            let bound = parse_signature_type(chars)?;
+            Some(format!("? extends {bound}"))
+        }
+        '-' => {
+            chars.next();
+            let bound = parse_signature_type(chars)?;
+            Some(format!("? super {bound}"))
+        }
+        _ => parse_signature_type(chars),
     }
 }
 
