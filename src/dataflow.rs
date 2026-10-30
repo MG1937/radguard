@@ -2175,11 +2175,11 @@ fn recover_types_and_constants(graph: &mut Graph, return_type: &str) {
                             Value::Binary(binary) if binary.op == BinaryOp::Compare
                         );
                         if is_compare && !graph.variables.is_declared(lhs) {
-                            if current_ty != Some("I") {
-                                if let Some(var) = graph.variables.get_mut(lhs) {
-                                    var.ty = Some(Cow::Borrowed("I"));
-                                    changed = true;
-                                }
+                            if current_ty != Some("I")
+                                && let Some(var) = graph.variables.get_mut(lhs)
+                            {
+                                var.ty = Some(Cow::Borrowed("I"));
+                                changed = true;
                             }
                         } else if !graph.variables.is_declared(lhs)
                             && let Some(inferred) = (if let Value::Invoke(invoke) = rhs
