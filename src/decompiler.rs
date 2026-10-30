@@ -270,12 +270,23 @@ impl<'a> Decompiler<'a> {
         }
         output.source.push_str(" {\n");
 
+        let mut synthetic_members = std::collections::HashSet::new();
         let field_annotations = if self.include_metadata {
             Some(self.dex.field_annotations(class)?)
         } else {
             None
         };
         for field in class.fields() {
+            if field.access_flags & 0x1000 != 0
+                && let Ok(resolved) = self.dex.field(field.field_idx)
+            {
+                synthetic_members.insert((
+                    MemberKind::Field,
+                    resolved.class.to_owned(),
+                    resolved.name.to_owned(),
+                    resolved.ty.to_owned(),
+                ));
+            }
             let annotations = field_annotations
                 .as_ref()
                 .and_then(|annotations| annotations.get(&field.field_idx))
@@ -289,12 +300,36 @@ impl<'a> Decompiler<'a> {
             None
         };
         for method in class.methods() {
+            if (method.access_flags & 0x1040 != 0)
+                && let Ok(resolved) = self.dex.method(method.method_idx)
+            {
+                synthetic_members.insert((
+                    MemberKind::Method,
+                     descriptor.to_owned(),
+                    resolved.name.to_owned(),
+                    resolved.descriptor.to_owned(),
+                ));
+            }
             let annotations = method_annotations
                 .as_ref()
                 .and_then(|annotations| annotations.get(&method.method_idx))
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             output = self.write_method(output, descriptor, &name, method, annotations)?;
+        }
+        if !synthetic_members.is_empty() {
+            for r in &mut output.member_references {
+                if !r.synthetic
+                    && synthetic_members.contains(&(
+                        r.kind.clone(),
+                        r.class.clone(),
+                        r.name.clone(),
+                        r.descriptor.clone(),
+                    ))
+                {
+                    r.synthetic = true;
+                }
+            }
         }
         output.source.push_str("}\n");
         Ok(output)
@@ -335,6 +370,7 @@ impl<'a> Decompiler<'a> {
             name: resolved.name.to_owned(),
             descriptor: resolved.ty.to_owned(),
             declaration: true,
+            synthetic: field.access_flags & 0x1000 != 0,
         });
         if let Some(value) = &field.initial_value {
             output.source.push_str(" = ");
@@ -406,6 +442,7 @@ impl<'a> Decompiler<'a> {
             name: resolved.name.to_owned(),
             descriptor: resolved.descriptor.to_owned(),
             declaration: true,
+            synthetic: method.access_flags & 0x1040 != 0,
         });
 
         let lowered =

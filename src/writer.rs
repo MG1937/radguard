@@ -6,7 +6,7 @@ use crate::ir::{
 };
 use crate::types::{descriptor_to_java, descriptor_to_java_enhanced};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MemberKind {
     Method,
     Field,
@@ -21,6 +21,7 @@ pub struct MemberReference {
     pub name: String,
     pub descriptor: String,
     pub declaration: bool,
+    pub synthetic: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1680,6 +1681,7 @@ impl<'a> MethodWriter<'a> {
                 name: method.name.clone(),
                 descriptor: method_descriptor(method),
                 declaration: false,
+                synthetic: false,
             });
         }
         self.write("(");
@@ -1886,6 +1888,7 @@ impl<'a> MethodWriter<'a> {
             name: field.name.to_string(),
             descriptor: field.ty.to_string(),
             declaration,
+            synthetic: false,
         });
     }
 
